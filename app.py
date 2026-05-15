@@ -3,6 +3,8 @@ import pandas as pd
 from supabase import create_client, Client
 from datetime import date, datetime, timedelta
 import numpy as np
+import smtplib
+from email.message import EmailMessage
 from collections import defaultdict
 
 # ---------- CONFIG ----------
@@ -10,7 +12,7 @@ SUPABASE_URL = st.secrets["SUPABASE_URL"]
 SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ---------- AUTH (two passwords) ----------
+# ---------- AUTH ----------
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
     st.session_state.user_role = None
@@ -25,791 +27,452 @@ if not st.session_state.authenticated:
         st.session_state.authenticated = True
         st.session_state.user_role = "viewer"
         st.rerun()
-    elif pwd:  # only show error if something was entered
+    elif pwd:
         st.error("Incorrect password")
     st.stop()
 
-# ---------- EMAIL LINK AUTO-MARK (One-Click Done from Email) ----------
-params = st.query_params
-if "alert_id" in params and "action" in params:
-    alert_id = params["alert_id"][0] if isinstance(params["alert_id"], list) else params["alert_id"]
-    supabase.table("alert_log").update({
-        "action_taken": "Marked done via email link",
-        "action_date": "now()"
-    }).eq("id", alert_id).execute()
-    st.success(f"✅ Alert #{alert_id} marked as done!")
-    st.query_params.clear()
-    st.rerun()
-
-# ---------- GLOBAL BRANCH SELECTOR ----------
-branches_data = supabase.table("branches").select("*").execute().data
-branch_options = {b['code']: b['id'] for b in branches_data}
-branch_names = [b['name'] for b in branches_data]
-
-selected_branch_name = st.sidebar.selectbox("Select Branch", ["All Branches"] + branch_names)
-if selected_branch_name == "All Branches":
-    branch_id = None
-else:
-    branch_id = next(b['id'] for b in branches_data if b['name'] == selected_branch_name)
-
-# ---------- NAVIGATION (role‑based) ----------
-if st.session_state.user_role == "admin":
-    pages = [
-        "Dashboard",
-        "Branches",
-        "Products",
-        "Inventory",
-        "CSV Upload",
-        "Alerts & Advisories",
-        "AI Limits",
-        "Risk & FEFO",
-        "Transfer Suggestions"
-    ]
-else:  # viewer
-    pages = [
-        "Dashboard",
-        "Products",
-        "Inventory",
-        "CSV Upload",
-        "Alerts & Advisories",
-        "AI Limits",
-        "Risk & FEFO",
-        "Transfer Suggestions"
-    ]
-
-page = st.sidebar.radio("Go to", pages)
-
-# ---------- HELPERS ----------
-def validate_csv_columns(df, required_cols, label="CSV"):
-    missing = required_cols - set(df.columns)
-    if missing:
-        return False, f"❌ Missing columns in {label}: {', '.join(missing)}\n\n📋 Required: {', '.join(required_cols)}"
-    return True, ""
-
-def upload_csv_to_table(table_name, df, extra_columns={}):
-    for col, val in extra_columns.items():
-        df[col] = val
-    records = df.to_dict(orient="records")
-    try:
-        res = supabase.table(table_name).insert(records).execute()
-        return res
-    except Exception as e:
-        st.error(f"Error inserting into {table_name}: {e}")
-        return None
-
-def get_sales_velocity(branch_id, product_id, days_back=30):
-    limit_res = supabase.table("stock_limits").select("avg_daily_demand") \
-        .eq("branch_id", branch_id).eq("product_id", product_id).execute()
-    if limit_res.data and limit_res.data[0].get("avg_daily_demand") is not None:
-        return float(limit_res.data[0]["avg_daily_demand"])
-    
+# ---------- HELPER FUNCTIONS ----------
+def get_sales_velocity(product_id, days_back=30):
+    """Return average daily demand (units) for a product."""
+    # First check stock_limits table
+    res = supabase.table("stock_limits").select("avg_daily_demand") \
+        .eq("product_id", product_id).execute()
+    if res.data and res.data[0].get("avg_daily_demand") is not None:
+        return float(res.data[0]["avg_daily_demand"])
+    # Fallback: compute from stock_movements (sales)
     start_date = (date.today() - timedelta(days=days_back)).isoformat()
-    mov_res = supabase.table("stock_movements").select("quantity_change") \
-        .eq("branch_id", branch_id).eq("product_id", product_id) \
+    mov = supabase.table("stock_movements").select("quantity_change") \
+        .eq("product_id", product_id) \
+        .eq("movement_type", "sale") \
         .gte("movement_date", start_date).execute()
-    if mov_res.data:
-        total_sold = abs(sum(m["quantity_change"] for m in mov_res.data if m["quantity_change"] < 0))
-        return total_sold / days_back
-    return 0.0
+    total_sold = sum(abs(m["quantity_change"]) for m in mov.data) if mov.data else 0
+    return total_sold / days_back
 
-def get_reorder_point(branch_id, product_id):
+def get_reorder_point(product_id):
+    """Return (reorder_point, safety_stock) from stock_limits or compute dynamic."""
     lim = supabase.table("stock_limits").select("reorder_point, safety_stock") \
-        .eq("branch_id", branch_id).eq("product_id", product_id).execute()
-    if lim.data:
-        return lim.data[0].get("reorder_point", 0), lim.data[0].get("safety_stock", 0)
-    demand = get_sales_velocity(branch_id, product_id)
-    reorder = max(5, int(demand * 7))
+        .eq("product_id", product_id).execute()
+    if lim.data and lim.data[0].get("reorder_point") is not None:
+        return lim.data[0]["reorder_point"], lim.data[0]["safety_stock"]
+    demand = get_sales_velocity(product_id)
+    lead_time = get_product_lead_time(product_id)
+    reorder = max(5, int(demand * lead_time * 1.5))
     safety = max(3, int(demand * 3))
     return reorder, safety
 
-# ============================================================
-# PAGE: DASHBOARD
-# ============================================================
+def get_product_lead_time(product_id):
+    res = supabase.table("products").select("lead_time_days").eq("id", product_id).execute()
+    if res.data:
+        return res.data[0].get("lead_time_days", 7)
+    return 7
+
+def get_current_stock(product_id):
+    """Total quantity across all batches."""
+    inv = supabase.table("inventory").select("quantity").eq("product_id", product_id).execute()
+    return sum(i["quantity"] for i in inv.data) if inv.data else 0
+
+def record_sale(product_id, quantity_sold, selling_price_per_unit, sale_date=None):
+    """
+    Deduct stock using FEFO (earliest expiry first), record sale and stock movement.
+    Returns (success, message).
+    """
+    if sale_date is None:
+        sale_date = date.today().isoformat()
+    # Get all batches with quantity > 0, sorted by expiry
+    batches = supabase.table("inventory").select("id, quantity, unit_cost, expiry_date") \
+        .eq("product_id", product_id).gt("quantity", 0).order("expiry_date").execute().data
+    if not batches:
+        return False, "No stock available for this product."
+    remaining = quantity_sold
+    cogs_total = 0.0
+    used_batches = []
+    for batch in batches:
+        if remaining <= 0:
+            break
+        deduct = min(remaining, batch["quantity"])
+        new_qty = batch["quantity"] - deduct
+        # Update inventory
+        supabase.table("inventory").update({"quantity": new_qty}).eq("id", batch["id"]).execute()
+        cogs_total += deduct * batch["unit_cost"]
+        remaining -= deduct
+        used_batches.append((batch["id"], deduct, batch["unit_cost"]))
+    if remaining > 0:
+        return False, f"Insufficient stock. Only {quantity_sold - remaining} units available."
+    # Insert sales record
+    avg_cogs = cogs_total / quantity_sold
+    sale_record = {
+        "sale_date": sale_date,
+        "product_id": product_id,
+        "quantity": quantity_sold,
+        "selling_price_per_unit": selling_price_per_unit,
+        "cogs_per_unit": avg_cogs,
+        "notes": f"Auto FEFO: {len(used_batches)} batches"
+    }
+    supabase.table("sales").insert(sale_record).execute()
+    # Insert stock movement
+    supabase.table("stock_movements").insert({
+        "product_id": product_id,
+        "quantity_change": -quantity_sold,
+        "movement_date": sale_date,
+        "movement_type": "sale",
+        "notes": f"Sale of {quantity_sold} units @ ₦{selling_price_per_unit}"
+    }).execute()
+    return True, f"Sale recorded. Profit: ₦{quantity_sold * (selling_price_per_unit - avg_cogs):,.2f}"
+
+def send_monthly_report(month_offset=1):
+    """Email monthly sales & profit summary for the previous month."""
+    today = date.today()
+    first_of_current = date(today.year, today.month, 1)
+    last_month_end = first_of_current - timedelta(days=1)
+    last_month_start = date(last_month_end.year, last_month_end.month, 1)
+    # Fetch sales in range
+    sales = supabase.table("sales").select("*, products(name)") \
+        .gte("sale_date", last_month_start.isoformat()) \
+        .lte("sale_date", last_month_end.isoformat()).execute().data
+    if not sales:
+        body = f"No sales recorded in {last_month_start.strftime('%B %Y')}."
+    else:
+        df = pd.DataFrame(sales)
+        total_rev = df["total_revenue"].sum()
+        total_cogs = df["total_cogs"].sum()
+        total_profit = df["profit"].sum()
+        margin = (total_profit / total_rev * 100) if total_rev else 0
+        # Product breakdown
+        prod_summary = df.groupby("products")["quantity"].sum().to_string()
+        body = f"""
+        Monthly Report – {last_month_start.strftime('%B %Y')}
+        ============================================
+        Total Revenue: ₦{total_rev:,.2f}
+        Total COGS:    ₦{total_cogs:,.2f}
+        Net Profit:    ₦{total_profit:,.2f}
+        Margin:        {margin:.1f}%
+
+        Top selling products (units):
+        {prod_summary}
+        """
+    # Send email
+    msg = EmailMessage()
+    msg.set_content(body)
+    msg["Subject"] = f"Muzoscents Monthly Report - {last_month_start.strftime('%B %Y')}"
+    msg["From"] = st.secrets["email"]["sender"]
+    msg["To"] = st.secrets["email"]["to_email"]
+    try:
+        with smtplib.SMTP(st.secrets["email"]["smtp_server"], st.secrets["email"]["smtp_port"]) as server:
+            server.starttls()
+            server.login(st.secrets["email"]["sender"], st.secrets["email"]["password"])
+            server.send_message(msg)
+        return True
+    except Exception as e:
+        st.error(f"Email failed: {e}")
+        return False
+
+def get_purchasing_advice():
+    """Return list of products needing reorder with suggested quantity."""
+    advice = []
+    products = supabase.table("products").select("id, name, sku, lead_time_days, reorder_point, safety_stock").execute().data
+    for p in products:
+        pid = p["id"]
+        stock = get_current_stock(pid)
+        velocity = get_sales_velocity(pid)
+        lead = p.get("lead_time_days", 7)
+        # Use stored reorder_point if exists, else compute
+        rp, ss = get_reorder_point(pid)
+        days_of_stock = stock / velocity if velocity > 0 else 999
+        suggested_qty = 0
+        reason = ""
+        if stock <= rp:
+            suggested_qty = max(int(velocity * lead * 2), 10)  # cover 2 lead times
+            reason = f"Stock ({stock}) below reorder point ({rp})"
+        elif days_of_stock < 14:
+            suggested_qty = max(int(velocity * lead * 1.5), 5)
+            reason = f"Only {days_of_stock:.0f} days of stock left"
+        if suggested_qty > 0:
+            advice.append({
+                "product": p["name"],
+                "sku": p["sku"],
+                "current_stock": stock,
+                "daily_demand": round(velocity, 2),
+                "days_of_stock": round(days_of_stock, 1),
+                "suggested_order_qty": suggested_qty,
+                "reason": reason,
+                "lead_time_days": lead
+            })
+    return advice
+
+# ---------- GLOBAL NAVIGATION ----------
+pages = ["Dashboard", "Products", "Inventory", "Sales Ledger", "Purchasing Advice",
+         "Risk & FEFO", "Alerts & Advisories", "AI Stock Limits", "CSV Upload", "Monthly Report"]
+if st.session_state.user_role == "viewer":
+    pages = [p for p in pages if p not in ["Products", "CSV Upload"]]  # viewers cannot edit master data
+
+page = st.sidebar.radio("Go to", pages)
+
+# ========== PAGE: DASHBOARD ==========
 if page == "Dashboard":
-    st.header("📊 Executive Summary")
-    inv_query = supabase.table("inventory").select("product_id, quantity, products(cost)")
-    alert_query = supabase.table("alert_log").select("*, products(cost)")
-    if branch_id:
-        inv_query = inv_query.eq("branch_id", branch_id)
-        alert_query = alert_query.eq("branch_id", branch_id)
-    inv = inv_query.execute().data
-    alerts = alert_query.execute().data
+    st.header("📊 Muzoscents Dashboard")
+    # Sales KPIs
+    sales = supabase.table("sales").select("total_revenue, total_cogs, profit").execute().data
+    if sales:
+        df_s = pd.DataFrame(sales)
+        total_rev = df_s["total_revenue"].sum()
+        total_cogs = df_s["total_cogs"].sum()
+        total_profit = df_s["profit"].sum()
+        margin = (total_profit / total_rev * 100) if total_rev else 0
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Total Revenue", f"₦{total_rev:,.0f}")
+        col2.metric("Total COGS", f"₦{total_cogs:,.0f}")
+        col3.metric("Net Profit", f"₦{total_profit:,.0f}")
+        col4.metric("Margin", f"{margin:.1f}%")
+    else:
+        st.info("No sales data yet. Add sales in 'Sales Ledger'.")
+    # Stock overview
+    inv_total = supabase.table("inventory").select("quantity, product_id").execute().data
+    if inv_total:
+        total_units = sum(i["quantity"] for i in inv_total)
+        st.metric("Total Inventory Units", total_units)
+    # Alerts summary
+    alerts = supabase.table("alert_log").select("alert_type, action_taken").execute().data
     if alerts:
         df_a = pd.DataFrame(alerts)
-        total_alerts = len(df_a)
-        expiring = df_a[df_a['alert_type'] == 'EXPIRY']
-        inv_df = pd.DataFrame(inv) if inv else pd.DataFrame()
-        wastage_val = 0
-        if not inv_df.empty:
-            for _, row in expiring.iterrows():
-                qty = inv_df[inv_df['product_id'] == row['product_id']]['quantity'].sum()
-                cost = row['products']['cost'] if row['products'] else 0
-                wastage_val += qty * cost
-        stockout = len(df_a[df_a['alert_type'] == 'RESTOCK'])
-        dead_stock = len(df_a[df_a['alert_type'] == 'DEAD_STOCK'])
-        actioned = len(df_a[df_a['action_taken'].notna()])
-        compliance = round((actioned / total_alerts * 100), 1) if total_alerts else 0
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Waste Risk", f"₦{wastage_val:,.0f}")
-        c2.metric("Stock‑out Risks", stockout)
-        c3.metric("Dead Stock", dead_stock)
-        c4.metric("Actions Done", f"{compliance}%")
-        st.subheader("Alert Type Breakdown")
-        st.bar_chart(df_a['alert_type'].value_counts())
-    else:
-        st.info("No alert data available yet. Run the daily Edge Function to generate alerts.")
+        open_alerts = len(df_a[df_a["action_taken"].isna()])
+        st.metric("Open Alerts", open_alerts)
 
-# ============================================================
-# PAGE: BRANCHES (with admin‑only guard)
-# ============================================================
-elif page == "Branches":
-    # Extra hardening: stop viewers even if they manually navigate here
-    if st.session_state.user_role != "admin":
-        st.error("You do not have permission to manage branches.")
-        st.stop()
-
-    st.header("🏢 Branch Management")
-    st.subheader("Current Branches")
-    all_branches = supabase.table("branches").select("*").execute().data
-    if all_branches:
-        df_b = pd.DataFrame(all_branches)
-        display_cols = ['name','code','storekeeper_email','procurement_email','inventory_email','auditor_email','manager_email']
-        st.dataframe(df_b[display_cols].rename(columns={
-            'name':'Name', 'code':'Code', 'storekeeper_email':'Storekeeper', 'procurement_email':'Procurement',
-            'inventory_email':'Inventory', 'auditor_email':'Auditor', 'manager_email':'Manager'
-        }))
-    else:
-        st.info("No branches yet.")
-    st.markdown("---")
-    st.subheader("➕ Add Single Branch")
-    with st.form("add_branch_form"):
-        col1, col2 = st.columns(2)
-        with col1:
-            name = st.text_input("Branch Name*")
-            code = st.text_input("Branch Code* (e.g., LG01)")
-        with col2:
-            storekeeper_email = st.text_input("Storekeeper Email")
-            procurement_email = st.text_input("Procurement Email")
-            inventory_email = st.text_input("Inventory Email")
-            auditor_email = st.text_input("Auditor Email")
-        submitted = st.form_submit_button("Add Branch")
-        if submitted:
-            if not name or not code:
-                st.error("Name and code are required.")
-            else:
-                try:
-                    supabase.table("branches").insert({
-                        "name": name,
-                        "code": code,
-                        "storekeeper_email": storekeeper_email or None,
-                        "procurement_email": procurement_email or None,
-                        "inventory_email": inventory_email or None,
-                        "auditor_email": auditor_email or None
-                    }).execute()
-                    st.success(f"Branch '{name}' added.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Failed: {e}")
-    st.markdown("---")
-    st.subheader("📁 Upload Branches CSV")
-    st.markdown("**CSV columns:** `name`, `code`, `storekeeper_email`, `procurement_email`, `inventory_email`, `auditor_email`")
-    template_df = pd.DataFrame(columns=['name','code','storekeeper_email','procurement_email','inventory_email','auditor_email'])
-    csv = template_df.to_csv(index=False)
-    st.download_button("📥 Download Branch Template", csv, "branches_template.csv", "text/csv")
-    uploaded_file = st.file_uploader("Choose branches CSV", type="csv", key="branches_csv")
-    if uploaded_file:
-        df = pd.read_csv(uploaded_file)
-        st.dataframe(df.head())
-        required = {'name','code'}
-        is_valid, msg = validate_csv_columns(df, required, "branches CSV")
-        if not is_valid:
-            st.error(msg)
-            st.stop()
-        for col in ['storekeeper_email','procurement_email','inventory_email','auditor_email']:
-            if col not in df.columns:
-                df[col] = None
-        if st.button("Upload Branches"):
-            records = df[['name','code','storekeeper_email','procurement_email','inventory_email','auditor_email']].to_dict(orient="records")
-            try:
-                supabase.table("branches").insert(records).execute()
-                st.success("Branches uploaded!")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Upload failed: {e}")
-
-# ============================================================
-# PAGE: PRODUCTS
-# ============================================================
+# ========== PAGE: PRODUCTS ==========
 elif page == "Products":
     st.header("📦 Products Master")
-    st.subheader("Current Products")
+    if st.session_state.user_role != "admin":
+        st.error("Admin only.")
+        st.stop()
+    # Show products table
     prods = supabase.table("products").select("*").execute().data
     if prods:
         df_p = pd.DataFrame(prods)
-        st.dataframe(df_p[['sku','name','category','shelf_life_days','cost']].rename(columns={
-            'sku':'SKU','name':'Name','category':'Category','shelf_life_days':'Shelf Life (days)','cost':'Unit Cost (₦)'
-        }))
+        st.dataframe(df_p[["sku","name","category","selling_price","lead_time_days","shelf_life_days"]])
     else:
-        st.info("No products yet.")
-    st.markdown("---")
-    st.subheader("➕ Add Single Product")
-    with st.form("add_product_form"):
-        col1, col2 = st.columns(2)
-        with col1:
-            sku = st.text_input("SKU*")
-            name = st.text_input("Product Name*")
-            category = st.text_input("Category")
-        with col2:
-            shelf_life = st.number_input("Shelf Life (days)", min_value=1, value=90)
-            cost = st.number_input("Unit Cost (₦)", min_value=0.0, value=0.0, format="%.2f")
-        submitted = st.form_submit_button("Add Product")
-        if submitted:
-            if not sku or not name:
-                st.error("SKU and name are required.")
-            else:
-                try:
-                    supabase.table("products").insert({
-                        "sku": sku,
-                        "name": name,
-                        "category": category or None,
-                        "shelf_life_days": shelf_life,
-                        "cost": cost
-                    }).execute()
-                    st.success(f"Product '{name}' added.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Failed: {e}")
-    st.markdown("---")
-    st.subheader("📁 Upload Products CSV")
-    st.markdown("**CSV columns:** `sku`, `name`, `category`, `shelf_life_days`, `cost`")
-    template_p = pd.DataFrame(columns=['sku','name','category','shelf_life_days','cost'])
-    csv_p = template_p.to_csv(index=False)
-    st.download_button("📥 Download Product Template", csv_p, "products_template.csv", "text/csv")
-    uploaded_file = st.file_uploader("Choose products CSV", type="csv", key="products_csv")
-    if uploaded_file:
-        df = pd.read_csv(uploaded_file)
-        st.dataframe(df.head())
-        required = {'sku','name'}
-        is_valid, msg = validate_csv_columns(df, required, "products CSV")
-        if not is_valid:
-            st.error(msg)
-            st.stop()
-        if 'category' not in df.columns:
-            df['category'] = None
-        if 'shelf_life_days' not in df.columns:
-            df['shelf_life_days'] = 90
-        if 'cost' not in df.columns:
-            df['cost'] = 0.0
-        if st.button("Upload Products"):
-            records = df[['sku','name','category','shelf_life_days','cost']].to_dict(orient="records")
-            try:
-                supabase.table("products").insert(records).execute()
-                st.success("Products uploaded!")
+        st.info("No products.")
+    with st.form("add_product"):
+        sku = st.text_input("SKU")
+        name = st.text_input("Name")
+        cat = st.text_input("Category")
+        sp = st.number_input("Selling Price (₦)", min_value=0.0, step=0.5)
+        lead = st.number_input("Lead Time (days)", min_value=1, value=7)
+        shelf = st.number_input("Shelf Life (days)", min_value=1, value=90)
+        if st.form_submit_button("Add Product"):
+            if sku and name:
+                supabase.table("products").insert({
+                    "sku": sku, "name": name, "category": cat, "selling_price": sp,
+                    "lead_time_days": lead, "shelf_life_days": shelf
+                }).execute()
+                st.success("Added")
                 st.rerun()
-            except Exception as e:
-                st.error(f"Upload failed: {e}")
 
-# ============================================================
-# PAGE: INVENTORY
-# ============================================================
+# ========== PAGE: INVENTORY ==========
 elif page == "Inventory":
-    st.header("📦 Current Inventory")
-    query = supabase.table("inventory").select("*, products(name, sku, cost), branches(name)")
-    if branch_id:
-        query = query.eq("branch_id", branch_id)
-    inv_data = query.execute().data
-    if inv_data:
-        df_i = pd.DataFrame(inv_data)
-        df_i['product'] = df_i['products'].apply(lambda x: x['name'] if x else '')
-        df_i['branch'] = df_i['branches'].apply(lambda x: x['name'] if x else '')
-        st.dataframe(df_i[['branch','product','batch','quantity','expiry_date','storage_location']])
+    st.header("📦 Current Stock (Batch Level)")
+    inv = supabase.table("inventory").select("*, products(name, sku)").execute().data
+    if inv:
+        df_i = pd.DataFrame(inv)
+        df_i["product"] = df_i["products"].apply(lambda x: x["name"] if x else "")
+        st.dataframe(df_i[["product","batch","quantity","unit_cost","expiry_date","storage_location"]])
     else:
-        st.info("No inventory records found.")
-    st.subheader("➕ Quick Manual Entry (one item)")
-    with st.form("manual_inv"):
+        st.info("No inventory records.")
+    with st.form("add_inventory"):
         prod_sku = st.text_input("Product SKU")
         batch = st.text_input("Batch")
         qty = st.number_input("Quantity", min_value=0)
+        unit_cost = st.number_input("Unit Cost (₦)", min_value=0.0)
         exp_date = st.date_input("Expiry Date", min_value=date.today())
-        location = st.selectbox("Storage Location", ["warehouse", "shelf", "cold_room"])
-        if st.form_submit_button("Add Item"):
-            if not prod_sku:
-                st.error("SKU required.")
+        loc = st.selectbox("Storage", ["warehouse","shelf","cold_room"])
+        if st.form_submit_button("Add Stock"):
+            prod = supabase.table("products").select("id").eq("sku", prod_sku).execute()
+            if not prod.data:
+                st.error("Product not found")
             else:
-                prod_res = supabase.table("products").select("id").eq("sku", prod_sku).execute()
-                if not prod_res.data:
-                    st.error("Product not found.")
-                else:
-                    br_id = branch_id if branch_id else st.selectbox("Branch", branch_names)
-                    if not br_id:
-                        br_id = branch_options[[b['code'] for b in branches_data if b['name'] == br_id][0]]
-                    supabase.table("inventory").insert({
-                        "branch_id": br_id,
-                        "product_id": prod_res.data[0]['id'],
-                        "batch": batch,
-                        "quantity": qty,
-                        "expiry_date": exp_date.isoformat() if exp_date else None,
-                        "storage_location": location
-                    }).execute()
-                    st.success("Item added!")
+                supabase.table("inventory").insert({
+                    "product_id": prod.data[0]["id"],
+                    "batch": batch,
+                    "quantity": qty,
+                    "unit_cost": unit_cost,
+                    "expiry_date": exp_date.isoformat(),
+                    "storage_location": loc
+                }).execute()
+                # Record movement
+                supabase.table("stock_movements").insert({
+                    "product_id": prod.data[0]["id"],
+                    "quantity_change": qty,
+                    "movement_date": date.today().isoformat(),
+                    "movement_type": "purchase",
+                    "notes": f"Batch {batch}"
+                }).execute()
+                st.success("Stock added")
+                st.rerun()
+
+# ========== PAGE: SALES LEDGER ==========
+elif page == "Sales Ledger":
+    st.header("🧾 Sales Ledger & Profit Tracking")
+    # Manual sale entry
+    with st.form("record_sale"):
+        prod_sku = st.text_input("Product SKU")
+        qty = st.number_input("Quantity sold", min_value=1)
+        selling_price = st.number_input("Selling price per unit (₦)", min_value=0.0, step=0.5)
+        sale_date = st.date_input("Sale Date", value=date.today())
+        if st.form_submit_button("Record Sale"):
+            prod = supabase.table("products").select("id, name").eq("sku", prod_sku).execute()
+            if not prod.data:
+                st.error("Product not found")
+            else:
+                ok, msg = record_sale(prod.data[0]["id"], qty, selling_price, sale_date.isoformat())
+                if ok:
+                    st.success(msg)
                     st.rerun()
-
-# ============================================================
-# PAGE: CSV UPLOAD
-# ============================================================
-elif page == "CSV Upload":
-    st.header("📁 Upload Inventory or Movement Data")
-    upload_type = st.selectbox("Data Type", ["Inventory (current stock)", "Stock Movements (sales/restock)"])
-    if branch_id:
-        selected_branch_id = branch_id
-        selected_branch_label = selected_branch_name
+                else:
+                    st.error(msg)
+    st.subheader("Sales History")
+    sales = supabase.table("sales").select("*, products(name, sku)").order("sale_date", desc=True).execute().data
+    if sales:
+        df_s = pd.DataFrame(sales)
+        df_s["product"] = df_s["products"].apply(lambda x: x["name"])
+        df_s["profit"] = df_s["profit"].apply(lambda x: f"₦{x:,.0f}")
+        st.dataframe(df_s[["sale_date","product","quantity","selling_price_per_unit","cogs_per_unit","profit"]])
+        total_profit = df_s["profit"].astype(str).str.replace("₦","").str.replace(",","").astype(float).sum()
+        st.metric("Total Profit (all time)", f"₦{total_profit:,.0f}")
     else:
-        branch_list = supabase.table("branches").select("id,name").execute().data
-        branch_map = {b['name']: b['id'] for b in branch_list}
-        selected_branch_label = st.selectbox("Select branch for data", list(branch_map.keys()))
-        selected_branch_id = branch_map[selected_branch_label]
-    uploaded_file = st.file_uploader("Choose CSV", type="csv", key="data_csv")
-    if uploaded_file:
-        df = pd.read_csv(uploaded_file)
-        st.dataframe(df.head())
-        if upload_type == "Inventory (current stock)":
-            required_cols = {'product_sku','batch','quantity','expiry_date','storage_location'}
-            is_valid, msg = validate_csv_columns(df, required_cols, "inventory CSV")
-            if not is_valid:
-                st.error(msg)
-                st.stop()
-            skus = df['product_sku'].unique().tolist()
-            products_data = supabase.table("products").select("id, sku").in_("sku", skus).execute().data
-            sku_to_id = {p['sku']: p['id'] for p in products_data}
-            df['product_id'] = df['product_sku'].map(sku_to_id)
-            missing = df[df['product_id'].isna()]['product_sku'].unique()
-            if len(missing) > 0:
-                st.error(f"❌ These SKUs not found in products: {missing}. Add them first.")
-                st.stop()
-            df['branch_id'] = selected_branch_id
-            df['expiry_date'] = pd.to_datetime(df['expiry_date']).dt.date
-            df = df[['branch_id','product_id','batch','quantity','expiry_date','storage_location']]
-            if st.button("Upload Inventory"):
-                res = upload_csv_to_table("inventory", df)
-                if res:
-                    st.success(f"Inventory uploaded for {selected_branch_label}!")
-        else:
-            required_cols = {'product_sku','quantity_change','movement_date'}
-            is_valid, msg = validate_csv_columns(df, required_cols, "movements CSV")
-            if not is_valid:
-                st.error(msg)
-                st.stop()
-            skus = df['product_sku'].unique().tolist()
-            products_data = supabase.table("products").select("id, sku").in_("sku", skus).execute().data
-            sku_to_id = {p['sku']: p['id'] for p in products_data}
-            df['product_id'] = df['product_sku'].map(sku_to_id)
-            missing = df[df['product_id'].isna()]['product_sku'].unique()
-            if len(missing) > 0:
-                st.error(f"❌ These SKUs not found: {missing}")
-                st.stop()
-            df['branch_id'] = selected_branch_id
-            df['movement_date'] = pd.to_datetime(df['movement_date']).dt.date
-            if 'notes' not in df.columns:
-                df['notes'] = ""
-            df = df[['branch_id','product_id','quantity_change','movement_date','notes']]
-            if st.button("Upload Movements"):
-                res = upload_csv_to_table("stock_movements", df)
-                if res:
-                    st.success(f"Movements uploaded for {selected_branch_label}!")
+        st.info("No sales yet.")
 
-# ============================================================
-# PAGE: ALERTS & ADVISORIES
-# ============================================================
+# ========== PAGE: PURCHASING ADVICE ==========
+elif page == "Purchasing Advice":
+    st.header("🛒 Intelligent Purchasing Recommendations")
+    st.caption("Based on sales velocity, current stock, lead times, and reorder points.")
+    advice = get_purchasing_advice()
+    if advice:
+        df_adv = pd.DataFrame(advice)
+        st.dataframe(df_adv)
+        st.subheader("Action Items")
+        for _, row in df_adv.iterrows():
+            st.info(f"**{row['product']}** – {row['reason']} → Order {row['suggested_order_qty']} units (lead time {row['lead_time_days']} days).")
+    else:
+        st.success("All products have healthy stock levels. No urgent reorder needed.")
+
+# ========== PAGE: RISK & FEFO ==========
+elif page == "Risk & FEFO":
+    st.header("⚠️ Expiry Risk & FEFO Recommendations")
+    # Similar logic as original but without branches
+    inv = supabase.table("inventory").select("*, products(name, sku, selling_price)").execute().data
+    if not inv:
+        st.info("No inventory data.")
+        st.stop()
+    risk_data = []
+    today = date.today()
+    for item in inv:
+        product = item.get("products") or {}
+        days_to_expiry = (datetime.strptime(item["expiry_date"], "%Y-%m-%d").date() - today).days
+        if days_to_expiry <= 0:
+            expiry_score = 100
+        elif days_to_expiry <= 7:
+            expiry_score = 95
+        elif days_to_expiry <= 30:
+            expiry_score = 80
+        elif days_to_expiry <= 90:
+            expiry_score = 50
+        else:
+            expiry_score = 20
+        financial = item["quantity"] * item["unit_cost"]
+        risk_data.append({
+            "Product": product.get("name"),
+            "Batch": item["batch"],
+            "Quantity": item["quantity"],
+            "Expiry": item["expiry_date"],
+            "Days Left": days_to_expiry,
+            "Risk Score": expiry_score * 0.7 + (financial / 10000) * 0.3
+        })
+    df_risk = pd.DataFrame(risk_data)
+    df_risk = df_risk.sort_values("Days Left")
+    st.dataframe(df_risk)
+    st.subheader("FEFO Order")
+    st.markdown("Consume in this order (earliest expiry first):")
+    for _, row in df_risk.iterrows():
+        st.write(f"- {row['Product']} (Batch `{row['Batch']}`) – expires {row['Expiry']}")
+
+# ========== PAGE: ALERTS & ADVISORIES ==========
 elif page == "Alerts & Advisories":
-    st.header("🚨 Alerts & Advisories")
-    query = supabase.table("alert_log").select("*, products(name), branches(name)")
-    if branch_id:
-        query = query.eq("branch_id", branch_id)
-    alerts = query.order("created_at", desc=True).execute().data
+    st.header("🚨 Alerts")
+    alerts = supabase.table("alert_log").select("*, products(name)").order("created_at", desc=True).execute().data
     if alerts:
         df_al = pd.DataFrame(alerts)
-        df_al['product'] = df_al['products'].apply(lambda x: x['name'] if x else '')
-        df_al['branch'] = df_al['branches'].apply(lambda x: x['name'] if x else '')
-        st.dataframe(df_al[['branch','product','batch','alert_type','details','action_taken','created_at']])
-        st.subheader("Manual Action Update")
-        unactioned = [a for a in alerts if not a.get('action_taken')]
+        df_al["product"] = df_al["products"].apply(lambda x: x["name"] if x else "")
+        st.dataframe(df_al[["product","batch","alert_type","details","action_taken","created_at"]])
+        # Manual action update
+        unactioned = [a for a in alerts if not a.get("action_taken")]
         if unactioned:
-            alert_id = st.selectbox("Select Alert ID", [a['id'] for a in unactioned])
-            action_text = st.text_input("Action Description")
+            alert_id = st.selectbox("Select Alert ID", [a["id"] for a in unactioned])
+            action = st.text_input("Action description")
             if st.button("Mark Done"):
-                supabase.table("alert_log").update({
-                    "action_taken": action_text,
-                    "action_date": "now()"
-                }).eq("id", alert_id).execute()
-                st.success("Marked as done.")
+                supabase.table("alert_log").update({"action_taken": action, "action_date": "now()"}).eq("id", alert_id).execute()
                 st.rerun()
-        else:
-            st.info("All alerts have been actioned.")
     else:
-        st.info("No alerts available. Good job!")
+        st.info("No alerts")
 
-# ============================================================
-# PAGE: AI LIMITS
-# ============================================================
-elif page == "AI Limits":
-    st.header("📊 AI-Computed Stock Limits")
-    st.caption("These limits are automatically updated daily based on sales velocity.")
-    lim_query = supabase.table("stock_limits").select("*, products(name), branches(name)")
-    if branch_id:
-        lim_query = lim_query.eq("branch_id", branch_id)
-    limits = lim_query.execute().data
+# ========== PAGE: AI STOCK LIMITS ==========
+elif page == "AI Stock Limits":
+    st.header("📊 AI‑Computed Stock Limits")
+    limits = supabase.table("stock_limits").select("*, products(name)").execute().data
     if limits:
-        df_l = pd.DataFrame(limits)
-        df_l['product'] = df_l['products'].apply(lambda x: x['name'] if x else '')
-        df_l['branch'] = df_l['branches'].apply(lambda x: x['name'] if x else '')
-        st.dataframe(df_l[['branch','product','avg_daily_demand','safety_stock','reorder_point','max_stock','calculated_at']])
+        df_lim = pd.DataFrame(limits)
+        df_lim["product"] = df_lim["products"].apply(lambda x: x["name"])
+        st.dataframe(df_lim[["product","avg_daily_demand","safety_stock","reorder_point","max_stock","calculated_at"]])
     else:
-        st.info("No AI limits computed yet. Ensure the Edge Function has run and stock movements exist.")
+        st.info("Run the daily Edge Function to compute limits.")
 
-# ============================================================
-# PAGE: RISK & FEFO (with skipped_no_expiry counter)
-# ============================================================
-elif page == "Risk & FEFO":
-    st.header("⚠️ Risk Scoring & FEFO Recommendations")
-    st.markdown("""
-    **FEFO** = *First Expired, First Out* – we recommend consuming batches with the earliest expiry date first.  
-    **Risk Score** combines expiry proximity, financial exposure, and sales velocity.  
-    **Risk Levels:** LOW 🟢 → MODERATE 🟡 → HIGH 🟠 → CRITICAL 🔴
-    """)
-    inv_query = supabase.table("inventory").select("""
-        id, batch, quantity, expiry_date, storage_location,
-        product_id, branch_id,
-        products(name, sku, cost)
-    """)
-    if branch_id:
-        inv_query = inv_query.eq("branch_id", branch_id)
-    inventory = inv_query.execute().data
-    if not inventory:
-        st.info("No inventory records found. Please upload inventory data first.")
-        st.stop()
-    today = date.today()
-    risk_data = []
-    velocity_cache = {}
-    unique_keys = {(item['branch_id'], item['product_id']) for item in inventory}
-    for (b_id, p_id) in unique_keys:
-        velocity_cache[(b_id, p_id)] = get_sales_velocity(b_id, p_id)
-    skipped_no_expiry = 0
-    for item in inventory:
-        product = item.get('products') or {}
-        product_name = product.get('name', 'Unknown')
-        sku = product.get('sku', '')
-        cost = float(product.get('cost', 0))
-        quantity = item.get('quantity', 0)
-        expiry_date_str = item.get('expiry_date')
-        if not expiry_date_str:
-            skipped_no_expiry += 1
-            continue
-        expiry_date = datetime.strptime(expiry_date_str, '%Y-%m-%d').date()
-        days_to_expiry = (expiry_date - today).days
-        if days_to_expiry <= 0:
-            expiry_score = 100.0
-        elif days_to_expiry <= 7:
-            expiry_score = 95.0
-        elif days_to_expiry <= 30:
-            expiry_score = 80.0
-        elif days_to_expiry <= 90:
-            expiry_score = 50.0
-        else:
-            expiry_score = 20.0
-        financial_value = quantity * cost
-        risk_data.append({
-            'item': item,
-            'product_name': product_name,
-            'sku': sku,
-            'batch': item['batch'],
-            'quantity': quantity,
-            'cost': cost,
-            'financial_value': financial_value,
-            'expiry_date': expiry_date,
-            'days_to_expiry': days_to_expiry,
-            'expiry_score': expiry_score,
-            'branch_id': item['branch_id'],
-            'product_id': item['product_id']
-        })
-    if skipped_no_expiry:
-        st.info(f"ℹ️ {skipped_no_expiry} items skipped because they have no expiry date.")
-    if not risk_data:
-        st.warning("No valid inventory items with expiry dates found.")
-        st.stop()
-    financial_vals = [d['financial_value'] for d in risk_data]
-    max_financial = max(financial_vals) if financial_vals else 1
-    for d in risk_data:
-        financial_score = (d['financial_value'] / max_financial) * 100 if max_financial > 0 else 0
-        d['financial_score'] = financial_score
-        velocity = velocity_cache.get((d['branch_id'], d['product_id']), 0.0)
-        if velocity <= 0.1:
-            velocity_score = 90.0
-        elif velocity <= 0.5:
-            velocity_score = 70.0
-        elif velocity <= 2:
-            velocity_score = 40.0
-        else:
-            velocity_score = 10.0
-        d['velocity_score'] = velocity_score
-        d['sales_velocity'] = velocity
-        risk_score = (d['expiry_score'] * 0.5) + (d['financial_score'] * 0.3) + (velocity_score * 0.2)
-        d['risk_score'] = risk_score
-        if risk_score >= 80:
-            risk_level = "CRITICAL"
-            risk_emoji = "🔴"
-        elif risk_score >= 60:
-            risk_level = "HIGH"
-            risk_emoji = "🟠"
-        elif risk_score >= 35:
-            risk_level = "MODERATE"
-            risk_emoji = "🟡"
-        else:
-            risk_level = "LOW"
-            risk_emoji = "🟢"
-        d['risk_level'] = f"{risk_emoji} {risk_level}"
-    df_risk = pd.DataFrame(risk_data)
-    df_risk['expiry_date'] = pd.to_datetime(df_risk['expiry_date']).dt.date
-    sort_by = st.selectbox("Sort by", ["Risk Score (highest first)", "Expiry Date (earliest first)", "Financial Value (highest first)"])
-    if sort_by == "Risk Score (highest first)":
-        df_display = df_risk.sort_values('risk_score', ascending=False)
-    elif sort_by == "Expiry Date (earliest first)":
-        df_display = df_risk.sort_values('expiry_date')
-    else:
-        df_display = df_risk.sort_values('financial_value', ascending=False)
-    st.subheader("📋 Batch Risk Assessment")
-    display_cols = ['product_name', 'sku', 'batch', 'quantity', 'cost', 'financial_value', 
-                    'expiry_date', 'days_to_expiry', 'sales_velocity', 'risk_level']
-    st.dataframe(df_display[display_cols].rename(columns={
-        'product_name': 'Product', 'sku': 'SKU', 'financial_value': 'Financial Exposure (₦)',
-        'days_to_expiry': 'Days Left', 'sales_velocity': 'Daily Demand (units)'
-    }))
-    st.subheader("📌 FEFO Recommendation (Consumption Order)")
-    fefo_df = df_risk.sort_values(['expiry_date', 'risk_score'], ascending=[True, False])
-    st.markdown("**Recommended order** – consume batches with earliest expiry date first, and within same expiry date prioritise higher risk:")
-    for idx, row in fefo_df.iterrows():
-        st.write(f"- **{row['product_name']}** (Batch `{row['batch']}`) – Expires **{row['expiry_date']}** – {row['risk_level']}")
-    st.subheader("📊 Risk Distribution")
-    risk_counts = df_risk['risk_level'].value_counts()
-    st.bar_chart(risk_counts)
-    with st.expander("ℹ️ How risk score is calculated"):
-        st.markdown("""
-        **Risk Score = (Expiry Score × 0.5) + (Financial Score × 0.3) + (Low Velocity Score × 0.2)**  
-        - **Expiry Score** (0–100): ≤0d→100, 1-7d→95, 8-30d→80, 31-90d→50, >90d→20  
-        - **Financial Score** (0–100): normalised quantity×cost  
-        - **Low Velocity Score** (0–100): ≤0.1 units/day→90, 0.11-0.5→70, 0.51-2→40, >2→10  
-        **Risk levels:** CRITICAL (≥80) → HIGH (60–79) → MODERATE (35–59) → LOW (<35)
-        """)
+# ========== PAGE: CSV UPLOAD ==========
+elif page == "CSV Upload":
+    st.header("📁 Bulk Upload (Products / Inventory / Sales)")
+    entity = st.selectbox("Entity", ["Products", "Inventory", "Sales"])
+    file = st.file_uploader("Upload CSV", type="csv")
+    if file:
+        df = pd.read_csv(file)
+        st.dataframe(df.head())
+        if st.button("Upload"):
+            try:
+                if entity == "Products":
+                    required = {"sku","name","selling_price"}
+                    if not all(c in df.columns for c in required):
+                        st.error(f"Missing columns: {required}")
+                    else:
+                        df["lead_time_days"] = df.get("lead_time_days", 7)
+                        supabase.table("products").insert(df.to_dict(orient="records")).execute()
+                        st.success("Products uploaded")
+                elif entity == "Inventory":
+                    required = {"product_sku","batch","quantity","unit_cost","expiry_date"}
+                    # Map SKU to product_id
+                    skus = df["product_sku"].unique()
+                    prods = {p["sku"]:p["id"] for p in supabase.table("products").select("id,sku").in_("sku", skus).execute().data}
+                    df["product_id"] = df["product_sku"].map(prods)
+                    if df["product_id"].isna().any():
+                        st.error("Some SKUs not found")
+                    else:
+                        df = df[["product_id","batch","quantity","unit_cost","expiry_date"]]
+                        supabase.table("inventory").insert(df.to_dict(orient="records")).execute()
+                        st.success("Inventory uploaded")
+                elif entity == "Sales":
+                    required = {"product_sku","quantity","selling_price_per_unit","sale_date"}
+                    # For each sale, call record_sale to handle FEFO
+                    for _, row in df.iterrows():
+                        prod = supabase.table("products").select("id").eq("sku", row["product_sku"]).execute()
+                        if prod.data:
+                            record_sale(prod.data[0]["id"], row["quantity"], row["selling_price_per_unit"], row["sale_date"])
+                    st.success("Sales processed")
+            except Exception as e:
+                st.error(f"Upload error: {e}")
 
-# ============================================================
-# PAGE: TRANSFER SUGGESTIONS (with days_str fix)
-# ============================================================
-elif page == "Transfer Suggestions":
-    st.header("🔄 Inter‑Branch Transfer Suggestions")
-    st.markdown("""
-    **Enterprise logic:** Automatically identifies surplus stock that can be moved to branches with deficit or high demand.
-    - **Surplus** = days of inventory > 45 days **OR** quantity > (reorder_point + safety_stock)
-    - **Deficit** = days of inventory < 7 days **OR** quantity < reorder_point
-    - **Expiry risk** = batches expiring within 30 days with low local demand → transfer to high‑demand branch
-    - **High‑value slow movers** = financial exposure > ₦100k and sales velocity < 0.5 units/day → consolidate
-    """)
-    
-    all_branches = supabase.table("branches").select("id, name").execute().data
-    if len(all_branches) < 2:
-        st.info("Need at least two branches to suggest transfers. Please add more branches.")
-        st.stop()
-    branch_map = {b['id']: b['name'] for b in all_branches}
-    
-    inv_all = supabase.table("inventory").select("""
-        id, batch, quantity, expiry_date, branch_id, product_id,
-        products(name, sku, cost)
-    """).execute().data
-    
-    if not inv_all:
-        st.info("No inventory data found. Please upload inventory first.")
-        st.stop()
-    
-    branch_product_data = defaultdict(lambda: {
-        'total_qty': 0,
-        'batches': [],
-        'cost': 0,
-        'sales_velocity': 0,
-        'reorder_point': 0,
-        'safety_stock': 0,
-        'days_inventory': float('inf')
-    })
-    
-    velocity_cache = {}
-    reorder_cache = {}
-    for inv_item in inv_all:
-        b_id = inv_item['branch_id']
-        p_id = inv_item['product_id']
-        key = (b_id, p_id)
-        if key not in velocity_cache:
-            velocity_cache[key] = get_sales_velocity(b_id, p_id)
-        if key not in reorder_cache:
-            rp, ss = get_reorder_point(b_id, p_id)
-            reorder_cache[key] = (rp, ss)
-    
-    for inv_item in inv_all:
-        b_id = inv_item['branch_id']
-        p_id = inv_item['product_id']
-        product = inv_item.get('products') or {}
-        cost = float(product.get('cost', 0))
-        qty = inv_item.get('quantity', 0)
-        expiry = inv_item.get('expiry_date')
-        key = (b_id, p_id)
-        
-        branch_product_data[key]['total_qty'] += qty
-        branch_product_data[key]['cost'] = cost
-        branch_product_data[key]['sales_velocity'] = velocity_cache.get(key, 0.0)
-        rp, ss = reorder_cache.get(key, (0,0))
-        branch_product_data[key]['reorder_point'] = rp
-        branch_product_data[key]['safety_stock'] = ss
-        
-        if expiry:
-            days_left = (datetime.strptime(expiry, '%Y-%m-%d').date() - date.today()).days
-            branch_product_data[key]['batches'].append({
-                'batch': inv_item['batch'],
-                'qty': qty,
-                'expiry_date': expiry,
-                'days_left': days_left
-            })
-    
-    for key, data in branch_product_data.items():
-        vel = data['sales_velocity']
-        if vel > 0:
-            data['days_inventory'] = data['total_qty'] / vel
-        else:
-            data['days_inventory'] = 999
-    
-    surplus_items = []
-    deficit_items = []
-    for key, data in branch_product_data.items():
-        b_id, p_id = key
-        qty = data['total_qty']
-        days = data['days_inventory']
-        rp = data['reorder_point']
-        ss = data['safety_stock']
-        is_surplus = (days > 45) or (qty > (rp + ss + 10))
-        is_deficit = (days < 7) or (qty < rp)
-        if is_surplus:
-            surplus_items.append({
-                'branch_id': b_id,
-                'product_id': p_id,
-                'quantity': qty,
-                'days_inventory': days,
-                'reorder_point': rp,
-                'safety_stock': ss,
-                'batches': data['batches'],
-                'cost': data['cost'],
-                'sales_velocity': data['sales_velocity']
-            })
-        if is_deficit:
-            deficit_items.append({
-                'branch_id': b_id,
-                'product_id': p_id,
-                'quantity': qty,
-                'days_inventory': days,
-                'reorder_point': rp,
-                'safety_stock': ss,
-                'batches': data['batches'],
-                'cost': data['cost'],
-                'sales_velocity': data['sales_velocity']
-            })
-    
-    suggestions = []
-    
-    for surp in surplus_items:
-        for defi in deficit_items:
-            if surp['product_id'] == defi['product_id'] and surp['branch_id'] != defi['branch_id']:
-                transfer_qty = min(surp['quantity'] - (surp['reorder_point'] + surp['safety_stock']), 
-                                   (defi['reorder_point'] + defi['safety_stock']) - defi['quantity'])
-                if transfer_qty > 0:
-                    days_from_str = f"{surp['days_inventory']:.0f}" if surp['days_inventory'] < 999 else "No recent sales"
-                    days_to_str = f"{defi['days_inventory']:.0f}" if defi['days_inventory'] < 999 else "No recent sales"
-                    suggestions.append({
-                        'from_branch': branch_map[surp['branch_id']],
-                        'to_branch': branch_map[defi['branch_id']],
-                        'product_name': next((p['products']['name'] for p in inv_all if p['product_id'] == surp['product_id']), 'Unknown'),
-                        'sku': next((p['products']['sku'] for p in inv_all if p['product_id'] == surp['product_id']), ''),
-                        'quantity': transfer_qty,
-                        'reason': f"Surplus in {branch_map[surp['branch_id']]} ({days_from_str} of stock) → deficit in {branch_map[defi['branch_id']]} (only {days_to_str} left).",
-                        'urgency': 'HIGH' if defi['days_inventory'] < 3 else 'MEDIUM'
-                    })
-    
-    for inv_item in inv_all:
-        expiry = inv_item.get('expiry_date')
-        if not expiry:
-            continue
-        days_left = (datetime.strptime(expiry, '%Y-%m-%d').date() - date.today()).days
-        if days_left <= 30:
-            b_id_from = inv_item['branch_id']
-            p_id = inv_item['product_id']
-            vel_from = velocity_cache.get((b_id_from, p_id), 0.0)
-            if vel_from <= 0.5:
-                best_target = None
-                best_vel = vel_from
-                for target_branch in all_branches:
-                    t_id = target_branch['id']
-                    if t_id == b_id_from:
-                        continue
-                    vel_to = velocity_cache.get((t_id, p_id), 0.0)
-                    if vel_to > best_vel:
-                        best_vel = vel_to
-                        best_target = t_id
-                if best_target and best_vel > vel_from + 0.2:
-                    suggestions.append({
-                        'from_branch': branch_map[b_id_from],
-                        'to_branch': branch_map[best_target],
-                        'product_name': inv_item['products']['name'],
-                        'sku': inv_item['products']['sku'],
-                        'quantity': inv_item['quantity'],
-                        'reason': f"Batch expires in {days_left} days, but current branch has very low demand ({vel_from:.1f} units/day). Transfer to {branch_map[best_target]} where demand is {best_vel:.1f} units/day to avoid waste.",
-                        'urgency': 'CRITICAL' if days_left <= 7 else 'HIGH'
-                    })
-    
-    for key, data in branch_product_data.items():
-        b_id, p_id = key
-        if data['total_qty'] * data['cost'] > 100000 and data['sales_velocity'] < 0.5:
-            if len(all_branches) > 1:
-                target_branch = all_branches[0]['id']
-                if target_branch == b_id:
-                    target_branch = all_branches[1]['id']
-                suggestions.append({
-                    'from_branch': branch_map[b_id],
-                    'to_branch': branch_map[target_branch],
-                    'product_name': next((p['products']['name'] for p in inv_all if p['product_id'] == p_id), 'Unknown'),
-                    'sku': next((p['products']['sku'] for p in inv_all if p['product_id'] == p_id), ''),
-                    'quantity': data['total_qty'],
-                    'reason': f"High‑value slow mover (₦{data['total_qty']*data['cost']:,.0f} value, {data['sales_velocity']:.1f} units/day). Consolidate to reduce holding cost.",
-                    'urgency': 'MEDIUM'
-                })
-    
-    unique_suggestions = []
-    seen = set()
-    for s in suggestions:
-        key = (s['from_branch'], s['to_branch'], s['product_name'])
-        if key not in seen:
-            seen.add(key)
-            unique_suggestions.append(s)
-    
-    if unique_suggestions:
-        df_sugg = pd.DataFrame(unique_suggestions)
-        urgency_order = {'CRITICAL': 0, 'HIGH': 1, 'MEDIUM': 2}
-        df_sugg['urgency_num'] = df_sugg['urgency'].map(urgency_order)
-        df_sugg = df_sugg.sort_values('urgency_num')
-        st.subheader("📋 Suggested Transfers")
-        st.dataframe(df_sugg[['from_branch', 'to_branch', 'product_name', 'sku', 'quantity', 'urgency', 'reason']])
-        st.subheader("📊 Summary by Urgency")
-        st.bar_chart(df_sugg['urgency'].value_counts())
-    else:
-        st.success("✅ No transfer suggestions at this time. Inventory appears well balanced.")
-    
-    with st.expander("ℹ️ How suggestions are generated"):
-        st.markdown("""
-        - **Surplus → Deficit:** A branch has >45 days of stock or exceeds reorder point + safety stock; another branch is below reorder point.
-        - **Expiry risk transfer:** Batch expiring in ≤30 days located in a slow‑selling branch is suggested to move to a branch with higher demand for that product.
-        - **High‑value slow movers:** Products with total value >₦100,000 and sales velocity <0.5 units/day are recommended for consolidation.
-        
-        Suggestions are deduplicated and sorted by urgency (CRITICAL → HIGH → MEDIUM).
-        """)
+# ========== PAGE: MONTHLY REPORT ==========
+elif page == "Monthly Report":
+    st.header("📧 Monthly Report")
+    st.markdown("Generate and email a summary of the previous month's sales and profit.")
+    if st.button("Send Monthly Report by Email"):
+        with st.spinner("Sending report..."):
+            success = send_monthly_report()
+            if success:
+                st.success("Report sent successfully!")
+            else:
+                st.error("Failed to send email. Check secrets and network.")
+    st.caption("Report is automatically based on last month's data. Configure recipient in secrets.")
