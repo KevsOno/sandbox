@@ -32,10 +32,10 @@ if not st.session_state.authenticated:
         st.error("Incorrect password")
     st.stop()
 
-# ---------- EMAIL LINK AUTO-MARK (fixed timestamp) ----------
+# ---------- EMAIL LINK AUTO-MARK ----------
 params = st.query_params
 if "alert_id" in params and "action" in params:
-    alert_id = params["alert_id"]  # modern Streamlit returns string, not list
+    alert_id = params["alert_id"]
     supabase.table("alert_log").update({
         "action_taken": "Marked done via email link",
         "action_date": datetime.now(timezone.utc).isoformat()
@@ -44,7 +44,7 @@ if "alert_id" in params and "action" in params:
     st.query_params.clear()
     st.rerun()
 
-# ---------- BRANCH SELECTOR with pagination reset ----------
+# ---------- BRANCH SELECTOR ----------
 @st.cache_data(ttl=300)
 def get_branches():
     return supabase.table("branches").select("id,name,code").execute().data
@@ -99,17 +99,26 @@ def upload_csv_to_table(table_name, df, extra_columns={}):
         error_msg = f"Upload failed at chunk {chunk_num}/{total_chunks}. No data was committed for this chunk. Error: {e}"
         return False, error_msg
 
+def chunked_sku_lookup(skus, chunk_size=200):
+    """Given a list of SKUs, return a dict {sku: id} using batched queries."""
+    sku_to_id = {}
+    for i in range(0, len(skus), chunk_size):
+        chunk = skus[i:i+chunk_size]
+        products_data = supabase.table("products").select("id, sku").in_("sku", chunk).execute().data
+        for p in products_data:
+            sku_to_id[p['sku']] = p['id']
+    return sku_to_id
+
 # ---------- PAGINATION COUNT CACHING ----------
 @st.cache_data(ttl=60, show_spinner=False)
 def get_cached_count(table_or_view, filter_col=None, filter_val=None):
-    """Returns exact count, cached for 60 seconds."""
     query = supabase.table(table_or_view).select("*", head=True, count="exact")
     if filter_col and filter_val:
         query = query.eq(filter_col, filter_val)
     return query.execute().count
 
 # ============================================================
-# PAGE: DASHBOARD (RPC aggregates, with alert limit)
+# PAGE: DASHBOARD
 # ============================================================
 if page == "Dashboard":
     st.header("📊 Executive Summary")
@@ -125,7 +134,6 @@ if page == "Dashboard":
     col1.metric("Total Inventory Value", f"₦{total_val:,.0f}")
     col2.metric("Waste Risk (next 30d)", f"₦{waste_val:,.0f}")
 
-    # Alert counts – cap to 1000 rows to avoid memory overload
     alert_query = supabase.table("alert_log").select("alert_type, action_taken")
     if branch_id:
         alert_query = alert_query.eq("branch_id", branch_id)
@@ -188,7 +196,7 @@ elif page == "Branches":
                             try:
                                 supabase.table("branches").update(update_data).eq("id", branch['id']).execute()
                                 st.success(f"✅ Branch '{new_name}' updated.")
-                                get_branches.clear()  # ✅ fixed: added parentheses
+                                get_branches.clear()
                                 st.rerun()
                             except Exception as e:
                                 st.error(f"Update failed: {e}")
@@ -223,13 +231,14 @@ elif page == "Branches":
                         "manager_email": manager_email or None
                     }).execute()
                     st.success(f"Branch '{name}' added.")
-                    get_branches.clear()  # ✅ fixed: added parentheses
+                    get_branches.clear()
                     st.rerun()
                 except Exception as e:
                     st.error(f"Failed: {e}")
     st.markdown("---")
     st.subheader("📁 Bulk Upload Branches CSV")
     st.markdown("**CSV columns:** `name`, `code`, `storekeeper_email`, `procurement_email`, `inventory_email`, `auditor_email`, `manager_email`")
+    st.info("📌 Recommended max rows: 500 – branches are typically small. Upload is chunked (500 rows per batch).")
     template_df = pd.DataFrame(columns=['name','code','storekeeper_email','procurement_email','inventory_email','auditor_email','manager_email'])
     csv = template_df.to_csv(index=False)
     st.download_button("📥 Download Branch Template", csv, "branches_template.csv", "text/csv")
@@ -255,7 +264,7 @@ elif page == "Branches":
                 st.error(err)
 
 # ============================================================
-# PAGE: PRODUCTS (explicit columns, cached count)
+# PAGE: PRODUCTS (pagination + CSV upload added)
 # ============================================================
 elif page == "Products":
     st.header("📦 Products Master")
@@ -301,8 +310,43 @@ elif page == "Products":
                 }).execute()
                 st.rerun()
 
+    st.markdown("---")
+    st.subheader("📁 Bulk Upload Products CSV")
+    st.markdown("""
+    **CSV columns:** `sku`, `name`, `category`, `shelf_life_days`, `cost`  
+    ⚠️ **Recommended max rows:** 5,000 per upload (chunked automatically into 500‑row batches).  
+    For larger product catalogues, split into multiple files.
+    """)
+    template_products = pd.DataFrame(columns=['sku','name','category','shelf_life_days','cost'])
+    template_products.loc[0] = ['SKU001', 'Test Product', 'Category A', 90, 1000.00]
+    csv_products = template_products.to_csv(index=False)
+    st.download_button("📥 Download Products CSV Template", csv_products, "products_template.csv", "text/csv")
+    uploaded_products = st.file_uploader("Choose products CSV", type="csv", key="products_csv_upload")
+    if uploaded_products:
+        df_prod = pd.read_csv(uploaded_products)
+        st.dataframe(df_prod.head())
+        required_prod = {'sku','name'}
+        is_valid, msg = validate_csv_columns(df_prod, required_prod, "products CSV")
+        if not is_valid:
+            st.error(msg)
+            st.stop()
+        # Ensure optional columns exist
+        if 'category' not in df_prod.columns:
+            df_prod['category'] = None
+        if 'shelf_life_days' not in df_prod.columns:
+            df_prod['shelf_life_days'] = 90
+        if 'cost' not in df_prod.columns:
+            df_prod['cost'] = 0.0
+        if st.button("Upload Products"):
+            success, err = upload_csv_to_table("products", df_prod[['sku','name','category','shelf_life_days','cost']])
+            if success:
+                st.success(f"Products uploaded! {len(df_prod)} rows processed.")
+                st.rerun()
+            else:
+                st.error(err)
+
 # ============================================================
-# PAGE: INVENTORY (uses view_inventory_list, explicit columns, cached count on the view)
+# PAGE: INVENTORY
 # ============================================================
 elif page == "Inventory":
     st.header("📦 Current Inventory")
@@ -311,7 +355,6 @@ elif page == "Inventory":
         st.session_state.inv_page = 0
     offset = st.session_state.inv_page * PAGE_SIZE
 
-    # ✅ Use the same view for count to avoid mismatch
     total = get_cached_count("view_inventory_list", filter_col="branch_id" if branch_id else None,
                              filter_val=branch_id if branch_id else None)
     total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
@@ -339,20 +382,23 @@ elif page == "Inventory":
     st.caption(f"Page {st.session_state.inv_page+1} of {total_pages}")
 
 # ============================================================
-# PAGE: CSV UPLOAD (unchanged)
+# PAGE: CSV UPLOAD (Inventory & Movements) with chunked SKU lookup
 # ============================================================
 elif page == "CSV Upload":
     st.header("📁 Upload Inventory or Movement Data")
     upload_type = st.selectbox("Data Type", ["Inventory (current stock)", "Stock Movements (sales/restock)"])
+
     if upload_type == "Inventory (current stock)":
         st.markdown("""
         ### 📋 Required CSV Headers for Inventory
-        Your CSV file **must** contain these exact column names:
-        - `product_sku` – the SKU of the product (must already exist in the Products table)
-        - `batch` – batch identifier (text, e.g., "BATCH-001")
-        - `quantity` – integer (number of units)
-        - `expiry_date` – date in YYYY-MM-DD format
-        - `storage_location` – one of: `warehouse`, `shelf`, `cold_room`
+        - `product_sku` – SKU (must exist in Products table)
+        - `batch` – batch identifier
+        - `quantity` – integer
+        - `expiry_date` – YYYY-MM-DD
+        - `storage_location` – warehouse / shelf / cold_room
+
+        ⚠️ **Recommended max rows:** 5,000 per upload (chunked into 500‑row batches).  
+        For larger inventories, split into multiple files.
         """)
         template_df = pd.DataFrame(columns=['product_sku','batch','quantity','expiry_date','storage_location'])
         template_df.loc[0] = ['SKU12345', 'BATCH-001', 100, '2026-12-31', 'warehouse']
@@ -361,11 +407,12 @@ elif page == "CSV Upload":
     else:
         st.markdown("""
         ### 📋 Required CSV Headers for Stock Movements
-        Your CSV file **must** contain these exact column names:
-        - `product_sku` – the SKU of the product (must already exist in the Products table)
-        - `quantity_change` – integer (positive for restock, negative for sales)
-        - `movement_date` – date in YYYY-MM-DD format
-        - `notes` (optional) – any additional text
+        - `product_sku` – SKU (must exist in Products table)
+        - `quantity_change` – integer (negative = sale, positive = restock)
+        - `movement_date` – YYYY-MM-DD
+        - `notes` – optional text
+
+        ⚠️ **Recommended max rows:** 10,000 per upload (chunked into 500‑row batches).
         """)
         template_df = pd.DataFrame(columns=['product_sku','quantity_change','movement_date','notes'])
         template_df.loc[0] = ['SKU12345', -5, '2026-05-17', 'Daily sales']
@@ -392,42 +439,48 @@ elif page == "CSV Upload":
             if not is_valid:
                 st.error(msg)
                 st.stop()
+
             skus = df['product_sku'].unique().tolist()
-            products_data = supabase.table("products").select("id, sku").in_("sku", skus).execute().data
-            sku_to_id = {p['sku']: p['id'] for p in products_data}
+            # chunked SKU lookup
+            sku_to_id = chunked_sku_lookup(skus)
             df['product_id'] = df['product_sku'].map(sku_to_id)
             missing = df[df['product_id'].isna()]['product_sku'].unique()
             if len(missing) > 0:
                 st.error(f"❌ SKUs not found in products table: {missing}. Please add them first.")
                 st.stop()
+
             df['branch_id'] = selected_branch_id
             df['expiry_date'] = pd.to_datetime(df['expiry_date']).dt.date
             df = df[['branch_id','product_id','batch','quantity','expiry_date','storage_location']]
+
             if st.button("Upload Inventory"):
                 success, err = upload_csv_to_table("inventory", df)
                 if success:
                     st.success(f"Inventory uploaded for {selected_branch_label}!")
                 else:
                     st.error(err)
-        else:
+
+        else:  # movements
             required_cols = {'product_sku','quantity_change','movement_date'}
             is_valid, msg = validate_csv_columns(df, required_cols, "movements CSV")
             if not is_valid:
                 st.error(msg)
                 st.stop()
+
             skus = df['product_sku'].unique().tolist()
-            products_data = supabase.table("products").select("id, sku").in_("sku", skus).execute().data
-            sku_to_id = {p['sku']: p['id'] for p in products_data}
+            sku_to_id = chunked_sku_lookup(skus)
             df['product_id'] = df['product_sku'].map(sku_to_id)
             missing = df[df['product_id'].isna()]['product_sku'].unique()
             if len(missing) > 0:
                 st.error(f"❌ SKUs not found in products table: {missing}")
                 st.stop()
+
             df['branch_id'] = selected_branch_id
             df['movement_date'] = pd.to_datetime(df['movement_date']).dt.date
             if 'notes' not in df.columns:
                 df['notes'] = ""
             df = df[['branch_id','product_id','quantity_change','movement_date','notes']]
+
             if st.button("Upload Movements"):
                 success, err = upload_csv_to_table("stock_movements", df)
                 if success:
@@ -436,7 +489,7 @@ elif page == "CSV Upload":
                     st.error(err)
 
 # ============================================================
-# PAGE: ALERTS & ADVISORIES (explicit columns, cached count)
+# PAGE: ALERTS & ADVISORIES (pagination)
 # ============================================================
 elif page == "Alerts & Advisories":
     st.header("🚨 Alerts & Advisories")
@@ -487,7 +540,7 @@ elif page == "Alerts & Advisories":
         st.info("All displayed alerts have been actioned.")
 
 # ============================================================
-# PAGE: AI LIMITS (explicit columns, cached count)
+# PAGE: AI LIMITS (pagination)
 # ============================================================
 elif page == "AI Limits":
     st.header("📊 AI-Computed Stock Limits")
@@ -524,7 +577,7 @@ elif page == "AI Limits":
     st.caption(f"Page {st.session_state.limits_page+1} of {total_pages}")
 
 # ============================================================
-# PAGE: RISK & FEFO (uses view_risk_list, explicit columns, cached count)
+# PAGE: RISK & FEFO (uses view_risk_list)
 # ============================================================
 elif page == "Risk & FEFO":
     st.header("⚠️ Risk Scoring & FEFO Recommendations")
@@ -580,7 +633,6 @@ elif page == "Risk & FEFO":
     st.caption(f"Page {st.session_state.risk_page+1} of {total_pages}")
 
     st.subheader("📌 FEFO Recommendation (Consumption Order)")
-    # ✅ Use the already globally sorted df_risk (database order applied)
     for idx, row in df_risk.head(20).iterrows():
         st.write(f"- **{row['product_name']}** (Batch `{row['batch']}`) – Expires **{row['expiry_date']}** – {row['risk_level']}")
 
@@ -600,7 +652,7 @@ elif page == "Risk & FEFO":
         """)
 
 # ============================================================
-# PAGE: TRANSFER SUGGESTIONS (database view, defensive)
+# PAGE: TRANSFER SUGGESTIONS (database view)
 # ============================================================
 elif page == "Transfer Suggestions":
     st.header("🔄 Inter‑Branch Transfer Suggestions")
