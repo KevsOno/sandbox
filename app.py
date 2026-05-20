@@ -83,10 +83,17 @@ def validate_csv_columns(df, required_cols, label="CSV"):
     return True, ""
 
 def upload_csv_to_table(table_name, df, extra_columns={}):
-    """Chunked upload with partial‑failure protection."""
+    """Chunked upload with partial‑failure protection and date serialization."""
     for col, val in extra_columns.items():
         df[col] = val
     records = df.to_dict(orient="records")
+    
+    # Convert any date/datetime objects to ISO string
+    for rec in records:
+        for k, v in rec.items():
+            if isinstance(v, (date, datetime)):
+                rec[k] = v.isoformat()
+    
     chunk_size = 500
     total_chunks = (len(records) + chunk_size - 1) // chunk_size
     i = 0
@@ -114,12 +121,10 @@ def ensure_products_exist(skus, default_cost=0.0, default_shelf_life=90):
     For any SKU not in the products table, insert a placeholder product.
     Returns a dict {sku: product_id} for all SKUs.
     """
-    # First, fetch existing SKUs (use chunked lookup to avoid URL limits)
     sku_to_id = chunked_sku_lookup(skus)
     missing = [sku for sku in skus if sku not in sku_to_id]
     
     if missing:
-        # Insert placeholder products for missing SKUs
         new_products = []
         for sku in missing:
             new_products.append({
@@ -129,11 +134,9 @@ def ensure_products_exist(skus, default_cost=0.0, default_shelf_life=90):
                 "shelf_life_days": default_shelf_life,
                 "cost": default_cost
             })
-        # Insert in chunks to avoid payload limit
         chunk_size = 200
         for i in range(0, len(new_products), chunk_size):
             supabase.table("products").insert(new_products[i:i+chunk_size]).execute()
-        # Fetch the newly created IDs (use chunked lookup again)
         sku_to_id.update(chunked_sku_lookup(missing))
         st.warning(f"⚠️ Auto-created {len(missing)} missing product(s) with default values. Please review and update them later in the Products page.")
     
@@ -471,7 +474,6 @@ elif page == "CSV Upload":
                 st.stop()
 
             skus = df['product_sku'].unique().tolist()
-            # Auto‑create missing products (no failure)
             sku_to_id = ensure_products_exist(skus)
             df['product_id'] = df['product_sku'].map(sku_to_id)
 
