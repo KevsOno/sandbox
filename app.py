@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 from supabase import create_client, Client
 from datetime import date, datetime, timedelta, timezone
-import math
 
 # ---------- CONFIG ----------
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
@@ -84,12 +83,12 @@ def validate_csv_columns(df, required_cols, label="CSV"):
     return True, ""
 
 def upload_csv_to_table(table_name, df, extra_columns={}):
-    """Chunked upload with partial‑failure protection and date serialization."""
+    """Chunked upload with date serialization and integer safety."""
     for col, val in extra_columns.items():
         df[col] = val
     records = df.to_dict(orient="records")
     
-    # Convert any date/datetime objects to ISO string
+    # Convert dates to ISO strings
     for rec in records:
         for k, v in rec.items():
             if isinstance(v, (date, datetime)):
@@ -104,11 +103,11 @@ def upload_csv_to_table(table_name, df, extra_columns={}):
             supabase.table(table_name).insert(records[i:i+chunk_size]).execute()
         return True, None
     except Exception as e:
-        error_msg = f"Upload failed at chunk {chunk_num}/{total_chunks}. No data was committed for this chunk. Error: {e}"
+        error_msg = f"Upload failed at chunk {chunk_num}/{total_chunks}. Error: {e}"
         return False, error_msg
 
 def chunked_sku_lookup(skus, chunk_size=200):
-    """Given a list of SKUs, return a dict {sku: id} using batched queries."""
+    """Return dict {sku: id} using batched queries."""
     sku_to_id = {}
     for i in range(0, len(skus), chunk_size):
         chunk = skus[i:i+chunk_size]
@@ -118,10 +117,7 @@ def chunked_sku_lookup(skus, chunk_size=200):
     return sku_to_id
 
 def ensure_products_exist(skus, default_cost=0.0, default_shelf_life=90):
-    """
-    For any SKU not in the products table, insert a placeholder product.
-    Returns a dict {sku: product_id} for all SKUs.
-    """
+    """Auto‑create missing products and return {sku: id} for all."""
     sku_to_id = chunked_sku_lookup(skus)
     missing = [sku for sku in skus if sku not in sku_to_id]
     
@@ -139,7 +135,7 @@ def ensure_products_exist(skus, default_cost=0.0, default_shelf_life=90):
         for i in range(0, len(new_products), chunk_size):
             supabase.table("products").insert(new_products[i:i+chunk_size]).execute()
         sku_to_id.update(chunked_sku_lookup(missing))
-        st.warning(f"⚠️ Auto-created {len(missing)} missing product(s) with default values. Please review and update them later in the Products page.")
+        st.warning(f"⚠️ Auto-created {len(missing)} missing product(s) with default values. Please review and update them later.")
     
     return sku_to_id
 
@@ -272,7 +268,7 @@ elif page == "Branches":
     st.markdown("---")
     st.subheader("📁 Bulk Upload Branches CSV")
     st.markdown("**CSV columns:** `name`, `code`, `storekeeper_email`, `procurement_email`, `inventory_email`, `auditor_email`, `manager_email`")
-    st.info("📌 Recommended max rows: 500 – branches are typically small. Upload is chunked (500 rows per batch).")
+    st.info("📌 Recommended max rows: 500. Upload is chunked (500 rows per batch).")
     template_df = pd.DataFrame(columns=['name','code','storekeeper_email','procurement_email','inventory_email','auditor_email','manager_email'])
     csv = template_df.to_csv(index=False)
     st.download_button("📥 Download Branch Template", csv, "branches_template.csv", "text/csv")
@@ -346,11 +342,7 @@ elif page == "Products":
 
     st.markdown("---")
     st.subheader("📁 Bulk Upload Products CSV")
-    st.markdown("""
-    **CSV columns:** `sku`, `name`, `category`, `shelf_life_days`, `cost`  
-    ⚠️ **Recommended max rows:** 5,000 per upload (chunked automatically into 500‑row batches).  
-    For larger product catalogues, split into multiple files.
-    """)
+    st.markdown("**CSV columns:** `sku`, `name`, `category`, `shelf_life_days`, `cost`  \n⚠️ **Recommended max rows:** 5,000 per upload.")
     template_products = pd.DataFrame(columns=['sku','name','category','shelf_life_days','cost'])
     template_products.loc[0] = ['SKU001', 'Test Product', 'Category A', 90, 1000.00]
     csv_products = template_products.to_csv(index=False)
@@ -370,7 +362,6 @@ elif page == "Products":
             df_prod['shelf_life_days'] = 90
         if 'cost' not in df_prod.columns:
             df_prod['cost'] = 0.0
-        # Ensure shelf_life_days is integer
         df_prod['shelf_life_days'] = pd.to_numeric(df_prod['shelf_life_days'], errors='coerce').fillna(90).astype(int)
         df_prod['cost'] = pd.to_numeric(df_prod['cost'], errors='coerce').fillna(0.0)
         if st.button("Upload Products"):
@@ -429,11 +420,11 @@ elif page == "CSV Upload":
         ### 📋 Required CSV Headers for Inventory
         - `product_sku` – SKU (will auto‑create product if missing)
         - `batch` – batch identifier
-        - `quantity` – integer (no decimals)
+        - `quantity` – integer
         - `expiry_date` – YYYY-MM-DD
         - `storage_location` – warehouse / shelf / cold_room
 
-        ⚠️ **Recommended max rows:** 5,000 per upload (chunked into 500‑row batches).  
+        ⚠️ **Recommended max rows:** 5,000 per upload (chunked automatically).  
         ✅ **Missing SKUs will be auto‑created** as placeholder products (you can edit them later).
         """)
         template_df = pd.DataFrame(columns=['product_sku','batch','quantity','expiry_date','storage_location'])
@@ -448,8 +439,8 @@ elif page == "CSV Upload":
         - `movement_date` – YYYY-MM-DD
         - `notes` – optional text
 
-        ⚠️ **Recommended max rows:** 10,000 per upload (chunked into 500‑row batches).  
-        ❗ Movements require that the SKU already exists in products (no auto‑creation for movements).
+        ⚠️ **Recommended max rows:** 10,000 per upload (chunked automatically).  
+        ❗ Movements require that the SKU already exists in products (no auto‑creation).
         """)
         template_df = pd.DataFrame(columns=['product_sku','quantity_change','movement_date','notes'])
         template_df.loc[0] = ['SKU12345', -5, '2026-05-17', 'Daily sales']
@@ -477,14 +468,18 @@ elif page == "CSV Upload":
                 st.error(msg)
                 st.stop()
 
-            # Convert quantity to integer (handle decimals)
-            df['quantity'] = pd.to_numeric(df['quantity'], errors='coerce').fillna(0).astype(int)
-            # Remove negative quantities (set to 0)
-            df['quantity'] = df['quantity'].clip(lower=0)
+            # Clean and convert
+            df['product_sku'] = df['product_sku'].astype(str).str.strip()
+            df = df[df['product_sku'].notna() & (df['product_sku'] != '')]
+            df['quantity'] = pd.to_numeric(df['quantity'], errors='coerce').fillna(0).astype(int).clip(lower=0)
 
             skus = df['product_sku'].unique().tolist()
             sku_to_id = ensure_products_exist(skus)
             df['product_id'] = df['product_sku'].map(sku_to_id)
+            if df['product_id'].isna().any():
+                missing_after = df[df['product_id'].isna()]['product_sku'].unique()
+                st.error(f"❌ SKUs could not be matched or created: {missing_after}. Please check product master.")
+                st.stop()
 
             df['branch_id'] = selected_branch_id
             df['expiry_date'] = pd.to_datetime(df['expiry_date']).dt.date
@@ -504,7 +499,8 @@ elif page == "CSV Upload":
                 st.error(msg)
                 st.stop()
 
-            # Convert quantity_change to integer
+            df['product_sku'] = df['product_sku'].astype(str).str.strip()
+            df = df[df['product_sku'].notna() & (df['product_sku'] != '')]
             df['quantity_change'] = pd.to_numeric(df['quantity_change'], errors='coerce').fillna(0).astype(int)
 
             skus = df['product_sku'].unique().tolist()
@@ -617,7 +613,7 @@ elif page == "AI Limits":
     st.caption(f"Page {st.session_state.limits_page+1} of {total_pages}")
 
 # ============================================================
-# PAGE: RISK & FEFO
+# PAGE: RISK & FEFO (user‑friendly sort labels)
 # ============================================================
 elif page == "Risk & FEFO":
     st.header("⚠️ Risk Scoring & FEFO Recommendations")
@@ -636,19 +632,28 @@ elif page == "Risk & FEFO":
                              filter_val=branch_id if branch_id else None)
     total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
 
-    sort_by = st.selectbox("Sort by", ["risk_score desc", "expiry_date asc", "financial_value desc"])
+    # User‑friendly sort options
+    sort_display = st.selectbox("Sort by", [
+        "Highest risk first",
+        "Earliest expiry first",
+        "Highest financial value first"
+    ])
+    # Map to actual column/order
+    if sort_display == "Highest risk first":
+        order_col = "risk_score"
+        order_desc = True
+    elif sort_display == "Earliest expiry first":
+        order_col = "expiry_date"
+        order_desc = False
+    else:
+        order_col = "financial_value"
+        order_desc = True
 
     query = supabase.table("view_risk_list").select("id,branch_id,branch_name,product_id,product_name,sku,batch,quantity,financial_value,expiry_date,days_to_expiry,risk_score,risk_level")
     if branch_id:
         query = query.eq("branch_id", branch_id)
 
-    if sort_by == "risk_score desc":
-        query = query.order("risk_score", desc=True)
-    elif sort_by == "expiry_date asc":
-        query = query.order("expiry_date", desc=False)
-    else:
-        query = query.order("financial_value", desc=True)
-
+    query = query.order(order_col, desc=order_desc)
     risk_scores = query.range(offset, offset+PAGE_SIZE-1).execute().data
 
     if not risk_scores:
@@ -692,18 +697,19 @@ elif page == "Risk & FEFO":
         """)
 
 # ============================================================
-# PAGE: TRANSFER SUGGESTIONS
+# PAGE: TRANSFER SUGGESTIONS (with Execute button that logs stock movements)
 # ============================================================
 elif page == "Transfer Suggestions":
     st.header("🔄 Inter‑Branch Transfer Suggestions")
     st.markdown("""
-    **Optimised suggestions** – computed entirely inside the database for speed and scalability.
-    - **Surplus → Deficit:** Branch has more than reorder point + safety stock + 5 units; another branch is below reorder point.
-    - **Urgency:** CRITICAL if deficit is high, HIGH if source branch has low sales velocity, else MEDIUM.
-    - No client‑side memory overhead – only final suggestions are fetched.
+    **Optimised suggestions** – computed entirely inside the database.
+    - **Surplus → Deficit:** Branch has excess stock; another branch needs it.
+    - **Expiry risk:** Batch expiring soon in a slow‑selling branch → transfer to a branch with higher demand.
+    - **Urgency:** CRITICAL (immediate attention), HIGH, or MEDIUM.
+    - Click **Execute** to record the transfer as stock movements – the system will automatically learn from it.
     """)
     try:
-        query = supabase.table("view_transfer_suggestions").select("*")
+        query = supabase.table("view_all_transfer_suggestions").select("*")
         if branch_id:
             query = query.eq("from_branch_id", branch_id)
         res = query.execute()
@@ -711,22 +717,96 @@ elif page == "Transfer Suggestions":
     except Exception as e:
         st.error("⚠️ Unable to fetch transfer suggestions. Please contact your administrator.")
         st.stop()
-    if isinstance(suggestions, list) and len(suggestions) > 0:
-        df_sugg = pd.DataFrame(suggestions)
-        st.subheader("📋 Suggested Transfers")
-        st.dataframe(df_sugg[['from_branch','to_branch','product_name','sku','quantity','urgency','reason']])
-        st.subheader("📊 Urgency Breakdown")
-        st.bar_chart(df_sugg['urgency'].value_counts())
-    else:
+    
+    if not isinstance(suggestions, list) or len(suggestions) == 0:
         st.success("✅ No transfer suggestions at this time. Inventory appears well balanced.")
+        st.stop()
+    
+    # Build dataframe
+    df_sugg = pd.DataFrame(suggestions)
+    display_cols = ['from_branch','to_branch','product_name','sku','quantity','urgency','reason']
+    if df_sugg['batch'].notna().any():
+        display_cols.insert(3, 'batch')
+    
+    # Show each suggestion with an Execute button
+    for idx, row in df_sugg.iterrows():
+        with st.container():
+            col1, col2 = st.columns([4, 1])
+            with col1:
+                st.markdown(f"**{row['product_name']}** ({row['sku']})")
+                st.markdown(f"📦 {row['quantity']} units from **{row['from_branch']}** → **{row['to_branch']}**")
+                st.caption(f"⚠️ {row['reason']} (Urgency: {row['urgency']})")
+                if pd.notna(row.get('batch')):
+                    st.caption(f"Batch: `{row['batch']}`")
+            with col2:
+                if st.button(f"✅ Execute", key=f"exec_{idx}"):
+                    try:
+                        # 1. Record movement at source branch (negative)
+                        supabase.table("stock_movements").insert({
+                            "branch_id": row['from_branch_id'],
+                            "product_id": row['product_id'],
+                            "quantity_change": -row['quantity'],
+                            "movement_date": date.today().isoformat(),
+                            "notes": f"Transfer to {row['to_branch']} - system suggestion on {date.today()}"
+                        }).execute()
+                        
+                        # 2. Record movement at target branch (positive)
+                        supabase.table("stock_movements").insert({
+                            "branch_id": row['to_branch_id'],
+                            "product_id": row['product_id'],
+                            "quantity_change": row['quantity'],
+                            "movement_date": date.today().isoformat(),
+                            "notes": f"Transfer from {row['from_branch']} - system suggestion"
+                        }).execute()
+                        
+                        # 3. Update inventory: decrease source, increase target
+                        # Source inventory update
+                        src_query = supabase.table("inventory").select("id, quantity").eq("branch_id", row['from_branch_id']).eq("product_id", row['product_id'])
+                        if pd.notna(row.get('batch')):
+                            src_query = src_query.eq("batch", row['batch'])
+                        src_inv = src_query.execute().data
+                        if src_inv:
+                            new_src_qty = src_inv[0]['quantity'] - row['quantity']
+                            supabase.table("inventory").update({"quantity": new_src_qty}).eq("id", src_inv[0]['id']).execute()
+                        else:
+                            st.warning(f"Source inventory record not found for product {row['product_id']} in branch {row['from_branch']}. Stock movement recorded but inventory not adjusted.")
+                        
+                        # Target inventory update (find or create)
+                        tgt_query = supabase.table("inventory").select("id, quantity").eq("branch_id", row['to_branch_id']).eq("product_id", row['product_id'])
+                        if pd.notna(row.get('batch')):
+                            tgt_query = tgt_query.eq("batch", row['batch'])
+                        tgt_inv = tgt_query.execute().data
+                        if tgt_inv:
+                            new_tgt_qty = tgt_inv[0]['quantity'] + row['quantity']
+                            supabase.table("inventory").update({"quantity": new_tgt_qty}).eq("id", tgt_inv[0]['id']).execute()
+                        else:
+                            # Create new inventory record at target branch
+                            # Use batch if provided, otherwise generate a transfer batch name
+                            batch_val = row.get('batch') if pd.notna(row.get('batch')) else f"TRANSFER-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+                            supabase.table("inventory").insert({
+                                "branch_id": row['to_branch_id'],
+                                "product_id": row['product_id'],
+                                "batch": batch_val,
+                                "quantity": row['quantity'],
+                                "expiry_date": None,  # optional; can be derived from source if needed
+                                "storage_location": "warehouse"
+                            }).execute()
+                        
+                        st.success(f"✅ Transfer of {row['quantity']} units executed! Stock movements recorded. The system will automatically learn from this in the next daily update.")
+                        # Refresh to remove the executed suggestion
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to execute transfer: {e}")
+            st.divider()
+    
+    st.subheader("📊 Urgency Breakdown")
+    st.bar_chart(df_sugg['urgency'].value_counts())
+    
     with st.expander("ℹ️ How suggestions are generated"):
         st.markdown("""
-        - A **surplus** branch has `total_qty > (reorder_point + safety_stock + 5)`.
-        - A **deficit** branch has `total_qty < reorder_point`.
-        - Transfer quantity is the smaller of surplus excess and deficit need.
-        - **Urgency:**  
-          - `CRITICAL` if the deficit branch needs less than 5 units to restock.  
-          - `HIGH` if the surplus branch has very low daily demand (<0.5 units/day).  
-          - `MEDIUM` otherwise.
+        - **Surplus → Deficit:** Branch has more than reorder point + safety stock + 5 units; another branch is below reorder point.
+        - **Expiry risk:** Batch expiring ≤30 days in a branch with very low demand (<0.5 units/day) → transfer to branch with higher demand.
+        - **Urgency:** CRITICAL (expiry ≤7 days or deficit very high), HIGH, or MEDIUM.
         - All calculations run inside PostgreSQL using indexed joins – no client‑side processing.
+        - When you click **Execute**, the system records stock movements and updates inventory, enabling automatic learning.
         """)
