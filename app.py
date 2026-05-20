@@ -109,6 +109,36 @@ def chunked_sku_lookup(skus, chunk_size=200):
             sku_to_id[p['sku']] = p['id']
     return sku_to_id
 
+def ensure_products_exist(skus, default_cost=0.0, default_shelf_life=90):
+    """
+    For any SKU not in the products table, insert a placeholder product.
+    Returns a dict {sku: product_id} for all SKUs.
+    """
+    # First, fetch existing SKUs (use chunked lookup to avoid URL limits)
+    sku_to_id = chunked_sku_lookup(skus)
+    missing = [sku for sku in skus if sku not in sku_to_id]
+    
+    if missing:
+        # Insert placeholder products for missing SKUs
+        new_products = []
+        for sku in missing:
+            new_products.append({
+                "sku": sku,
+                "name": f"Auto-created: {sku}",
+                "category": "Auto-created",
+                "shelf_life_days": default_shelf_life,
+                "cost": default_cost
+            })
+        # Insert in chunks to avoid payload limit
+        chunk_size = 200
+        for i in range(0, len(new_products), chunk_size):
+            supabase.table("products").insert(new_products[i:i+chunk_size]).execute()
+        # Fetch the newly created IDs (use chunked lookup again)
+        sku_to_id.update(chunked_sku_lookup(missing))
+        st.warning(f"⚠️ Auto-created {len(missing)} missing product(s) with default values. Please review and update them later in the Products page.")
+    
+    return sku_to_id
+
 # ---------- PAGINATION COUNT CACHING ----------
 @st.cache_data(ttl=60, show_spinner=False)
 def get_cached_count(table_or_view, filter_col=None, filter_val=None):
@@ -264,7 +294,7 @@ elif page == "Branches":
                 st.error(err)
 
 # ============================================================
-# PAGE: PRODUCTS (pagination + CSV upload added)
+# PAGE: PRODUCTS (pagination + CSV upload)
 # ============================================================
 elif page == "Products":
     st.header("📦 Products Master")
@@ -330,7 +360,6 @@ elif page == "Products":
         if not is_valid:
             st.error(msg)
             st.stop()
-        # Ensure optional columns exist
         if 'category' not in df_prod.columns:
             df_prod['category'] = None
         if 'shelf_life_days' not in df_prod.columns:
@@ -346,7 +375,7 @@ elif page == "Products":
                 st.error(err)
 
 # ============================================================
-# PAGE: INVENTORY
+# PAGE: INVENTORY (view based)
 # ============================================================
 elif page == "Inventory":
     st.header("📦 Current Inventory")
@@ -382,7 +411,7 @@ elif page == "Inventory":
     st.caption(f"Page {st.session_state.inv_page+1} of {total_pages}")
 
 # ============================================================
-# PAGE: CSV UPLOAD (Inventory & Movements) with chunked SKU lookup
+# PAGE: CSV UPLOAD (Inventory & Movements) with auto‑create products
 # ============================================================
 elif page == "CSV Upload":
     st.header("📁 Upload Inventory or Movement Data")
@@ -391,14 +420,14 @@ elif page == "CSV Upload":
     if upload_type == "Inventory (current stock)":
         st.markdown("""
         ### 📋 Required CSV Headers for Inventory
-        - `product_sku` – SKU (must exist in Products table)
+        - `product_sku` – SKU (will auto‑create product if missing)
         - `batch` – batch identifier
         - `quantity` – integer
         - `expiry_date` – YYYY-MM-DD
         - `storage_location` – warehouse / shelf / cold_room
 
         ⚠️ **Recommended max rows:** 5,000 per upload (chunked into 500‑row batches).  
-        For larger inventories, split into multiple files.
+        ✅ **Missing SKUs will be auto‑created** as placeholder products (you can edit them later).
         """)
         template_df = pd.DataFrame(columns=['product_sku','batch','quantity','expiry_date','storage_location'])
         template_df.loc[0] = ['SKU12345', 'BATCH-001', 100, '2026-12-31', 'warehouse']
@@ -412,7 +441,8 @@ elif page == "CSV Upload":
         - `movement_date` – YYYY-MM-DD
         - `notes` – optional text
 
-        ⚠️ **Recommended max rows:** 10,000 per upload (chunked into 500‑row batches).
+        ⚠️ **Recommended max rows:** 10,000 per upload (chunked into 500‑row batches).  
+        ❗ Movements require that the SKU already exists in products (no auto‑creation for movements).
         """)
         template_df = pd.DataFrame(columns=['product_sku','quantity_change','movement_date','notes'])
         template_df.loc[0] = ['SKU12345', -5, '2026-05-17', 'Daily sales']
@@ -441,13 +471,9 @@ elif page == "CSV Upload":
                 st.stop()
 
             skus = df['product_sku'].unique().tolist()
-            # chunked SKU lookup
-            sku_to_id = chunked_sku_lookup(skus)
+            # Auto‑create missing products (no failure)
+            sku_to_id = ensure_products_exist(skus)
             df['product_id'] = df['product_sku'].map(sku_to_id)
-            missing = df[df['product_id'].isna()]['product_sku'].unique()
-            if len(missing) > 0:
-                st.error(f"❌ SKUs not found in products table: {missing}. Please add them first.")
-                st.stop()
 
             df['branch_id'] = selected_branch_id
             df['expiry_date'] = pd.to_datetime(df['expiry_date']).dt.date
@@ -460,7 +486,7 @@ elif page == "CSV Upload":
                 else:
                     st.error(err)
 
-        else:  # movements
+        else:  # movements (no auto‑create)
             required_cols = {'product_sku','quantity_change','movement_date'}
             is_valid, msg = validate_csv_columns(df, required_cols, "movements CSV")
             if not is_valid:
@@ -472,7 +498,7 @@ elif page == "CSV Upload":
             df['product_id'] = df['product_sku'].map(sku_to_id)
             missing = df[df['product_id'].isna()]['product_sku'].unique()
             if len(missing) > 0:
-                st.error(f"❌ SKUs not found in products table: {missing}")
+                st.error(f"❌ SKUs not found in products table: {missing}. Please add them first (or use Inventory upload to auto‑create).")
                 st.stop()
 
             df['branch_id'] = selected_branch_id
@@ -489,7 +515,7 @@ elif page == "CSV Upload":
                     st.error(err)
 
 # ============================================================
-# PAGE: ALERTS & ADVISORIES (pagination)
+# PAGE: ALERTS & ADVISORIES
 # ============================================================
 elif page == "Alerts & Advisories":
     st.header("🚨 Alerts & Advisories")
@@ -540,7 +566,7 @@ elif page == "Alerts & Advisories":
         st.info("All displayed alerts have been actioned.")
 
 # ============================================================
-# PAGE: AI LIMITS (pagination)
+# PAGE: AI LIMITS
 # ============================================================
 elif page == "AI Limits":
     st.header("📊 AI-Computed Stock Limits")
@@ -577,7 +603,7 @@ elif page == "AI Limits":
     st.caption(f"Page {st.session_state.limits_page+1} of {total_pages}")
 
 # ============================================================
-# PAGE: RISK & FEFO (uses view_risk_list)
+# PAGE: RISK & FEFO
 # ============================================================
 elif page == "Risk & FEFO":
     st.header("⚠️ Risk Scoring & FEFO Recommendations")
@@ -652,7 +678,7 @@ elif page == "Risk & FEFO":
         """)
 
 # ============================================================
-# PAGE: TRANSFER SUGGESTIONS (database view)
+# PAGE: TRANSFER SUGGESTIONS
 # ============================================================
 elif page == "Transfer Suggestions":
     st.header("🔄 Inter‑Branch Transfer Suggestions")
