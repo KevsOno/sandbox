@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from supabase import create_client, Client
 from datetime import date, datetime, timedelta, timezone
+import math
 
 # ---------- CONFIG ----------
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
@@ -369,6 +370,9 @@ elif page == "Products":
             df_prod['shelf_life_days'] = 90
         if 'cost' not in df_prod.columns:
             df_prod['cost'] = 0.0
+        # Ensure shelf_life_days is integer
+        df_prod['shelf_life_days'] = pd.to_numeric(df_prod['shelf_life_days'], errors='coerce').fillna(90).astype(int)
+        df_prod['cost'] = pd.to_numeric(df_prod['cost'], errors='coerce').fillna(0.0)
         if st.button("Upload Products"):
             success, err = upload_csv_to_table("products", df_prod[['sku','name','category','shelf_life_days','cost']])
             if success:
@@ -425,7 +429,7 @@ elif page == "CSV Upload":
         ### 📋 Required CSV Headers for Inventory
         - `product_sku` – SKU (will auto‑create product if missing)
         - `batch` – batch identifier
-        - `quantity` – integer
+        - `quantity` – integer (no decimals)
         - `expiry_date` – YYYY-MM-DD
         - `storage_location` – warehouse / shelf / cold_room
 
@@ -473,6 +477,11 @@ elif page == "CSV Upload":
                 st.error(msg)
                 st.stop()
 
+            # Convert quantity to integer (handle decimals)
+            df['quantity'] = pd.to_numeric(df['quantity'], errors='coerce').fillna(0).astype(int)
+            # Remove negative quantities (set to 0)
+            df['quantity'] = df['quantity'].clip(lower=0)
+
             skus = df['product_sku'].unique().tolist()
             sku_to_id = ensure_products_exist(skus)
             df['product_id'] = df['product_sku'].map(sku_to_id)
@@ -494,6 +503,9 @@ elif page == "CSV Upload":
             if not is_valid:
                 st.error(msg)
                 st.stop()
+
+            # Convert quantity_change to integer
+            df['quantity_change'] = pd.to_numeric(df['quantity_change'], errors='coerce').fillna(0).astype(int)
 
             skus = df['product_sku'].unique().tolist()
             sku_to_id = chunked_sku_lookup(skus)
