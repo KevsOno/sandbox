@@ -696,9 +696,9 @@ elif page == "Transfer Suggestions":
     - **Stock imbalance:** Branch has excess stock; another branch needs it (expiry‑agnostic).
     - **Expiry risk:** Batch expiring soon in a slow‑selling branch → transfer to a branch with higher demand.
     - **Urgency:**  
-      - **CRITICAL** – Expiry ≤30 days **or** deficit very high (urgent transfer needed)  
-      - **HIGH** – Expiry 31–60 days  
-      - **MEDIUM** – Expiry 61–90 days
+      - **CRITICAL** – Expiry ≤60 days **or** deficit very high (urgent transfer needed)  
+      - **HIGH** – Expiry 61–90 days  
+      - **MEDIUM** – Expiry 91–120 days
     """)
     if st.session_state.user_role == "viewer":
         st.info("👁️ You are in view‑only mode. To execute transfers, please contact the supermarket manager.")
