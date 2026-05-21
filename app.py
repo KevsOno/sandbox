@@ -792,6 +792,6 @@ elif page == "Transfer Suggestions":
         st.markdown("""
         - **Stock imbalance transfer (surplus → deficit):** Branch has more than reorder point + safety stock + 5 units; another branch is below reorder point. Applies to all products (including non‑expiring).
         - **Expiry risk transfer:** Batch expiring ≤30 days in a branch with very low demand (<0.5 units/day) → transfer to branch with higher demand.
-        - **Urgency:** CRITICAL (expiry ≤30 days or deficit very high), HIGH (expiry 31–60 days), MEDIUM (expiry 61–90 days).
+        - **Urgency:** CRITICAL (expiry ≤60 days or deficit very high), HIGH (expiry 61–90 days), MEDIUM (expiry 91–120 days).
         - **Executing a transfer** records stock movements and updates inventory; the system automatically learns from it in the next daily update.
         """)
