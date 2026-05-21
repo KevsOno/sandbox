@@ -687,7 +687,7 @@ elif page == "Risk & FEFO":
         """)
 
 # ============================================================
-# PAGE: TRANSFER SUGGESTIONS (corrected urgency text)
+# PAGE: TRANSFER SUGGESTIONS (suggestions only – no execute button)
 # ============================================================
 elif page == "Transfer Suggestions":
     st.header("🔄 Inter‑Branch Transfer Suggestions")
@@ -700,8 +700,6 @@ elif page == "Transfer Suggestions":
       - **HIGH** – Expiry 61–90 days  
       - **MEDIUM** – Expiry 91–120 days
     """)
-    if st.session_state.user_role == "viewer":
-        st.info("👁️ You are in view‑only mode. To execute transfers, please contact the supermarket manager.")
     
     try:
         query = supabase.table("view_all_transfer_suggestions").select("*")
@@ -728,61 +726,14 @@ elif page == "Transfer Suggestions":
     if df_sugg['batch'].notna().any():
         display_cols.insert(3, 'batch')
     
+    # Display suggestions without any Execute button
     for idx, row in df_sugg.iterrows():
         with st.container():
-            col1, col2 = st.columns([4, 1])
-            with col1:
-                st.markdown(f"**{row['product_name']}** ({row['sku']})")
-                st.markdown(f"📦 {row['quantity']} units from **{row['from_branch']}** → **{row['to_branch']}**")
-                st.caption(f"🏷️ **{row['suggestion_type']}** – {row['reason']} (Urgency: {row['urgency']})")
-                if pd.notna(row.get('batch')):
-                    st.caption(f"Batch: `{row['batch']}`")
-            with col2:
-                if st.session_state.user_role == "admin":
-                    if st.button(f"✅ Execute", key=f"exec_{idx}"):
-                        try:
-                            supabase.table("stock_movements").insert({
-                                "branch_id": row['from_branch_id'],
-                                "product_id": row['product_id'],
-                                "quantity_change": -row['quantity'],
-                                "movement_date": date.today().isoformat(),
-                                "notes": f"Transfer to {row['to_branch']} - {row['suggestion_type']}"
-                            }).execute()
-                            supabase.table("stock_movements").insert({
-                                "branch_id": row['to_branch_id'],
-                                "product_id": row['product_id'],
-                                "quantity_change": row['quantity'],
-                                "movement_date": date.today().isoformat(),
-                                "notes": f"Transfer from {row['from_branch']} - {row['suggestion_type']}"
-                            }).execute()
-                            src_query = supabase.table("inventory").select("id, quantity").eq("branch_id", row['from_branch_id']).eq("product_id", row['product_id'])
-                            if pd.notna(row.get('batch')):
-                                src_query = src_query.eq("batch", row['batch'])
-                            src_inv = src_query.execute().data
-                            if src_inv:
-                                new_src_qty = src_inv[0]['quantity'] - row['quantity']
-                                supabase.table("inventory").update({"quantity": new_src_qty}).eq("id", src_inv[0]['id']).execute()
-                            tgt_query = supabase.table("inventory").select("id, quantity").eq("branch_id", row['to_branch_id']).eq("product_id", row['product_id'])
-                            if pd.notna(row.get('batch')):
-                                tgt_query = tgt_query.eq("batch", row['batch'])
-                            tgt_inv = tgt_query.execute().data
-                            if tgt_inv:
-                                new_tgt_qty = tgt_inv[0]['quantity'] + row['quantity']
-                                supabase.table("inventory").update({"quantity": new_tgt_qty}).eq("id", tgt_inv[0]['id']).execute()
-                            else:
-                                batch_val = row.get('batch') if pd.notna(row.get('batch')) else f"TRANSFER-{datetime.now().strftime('%Y%m%d%H%M%S')}"
-                                supabase.table("inventory").insert({
-                                    "branch_id": row['to_branch_id'],
-                                    "product_id": row['product_id'],
-                                    "batch": batch_val,
-                                    "quantity": row['quantity'],
-                                    "expiry_date": None,
-                                    "storage_location": "warehouse"
-                                }).execute()
-                            st.success(f"✅ Transfer of {row['quantity']} units executed!")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Failed to execute transfer: {e}")
+            st.markdown(f"**{row['product_name']}** ({row['sku']})")
+            st.markdown(f"📦 {row['quantity']} units from **{row['from_branch']}** → **{row['to_branch']}**")
+            st.caption(f"🏷️ **{row['suggestion_type']}** – {row['reason']} (Urgency: {row['urgency']})")
+            if pd.notna(row.get('batch')):
+                st.caption(f"Batch: `{row['batch']}`")
             st.divider()
     
     st.subheader("📊 Urgency Breakdown")
@@ -793,5 +744,5 @@ elif page == "Transfer Suggestions":
         - **Stock imbalance transfer (surplus → deficit):** Branch has more than reorder point + safety stock + 5 units; another branch is below reorder point. Applies to all products (including non‑expiring).
         - **Expiry risk transfer:** Batch expiring ≤30 days in a branch with very low demand (<0.5 units/day) → transfer to branch with higher demand.
         - **Urgency:** CRITICAL (expiry ≤60 days or deficit very high), HIGH (expiry 61–90 days), MEDIUM (expiry 91–120 days).
-        - **Executing a transfer** records stock movements and updates inventory; the system automatically learns from it in the next daily update.
+        - All calculations run inside PostgreSQL using indexed joins – no client‑side processing.
         """)
