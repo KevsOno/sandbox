@@ -6,6 +6,11 @@ import re
 from functools import wraps
 import hashlib
 import json
+import logging
+import io
+import traceback
+from typing import Dict, List, Any, Optional, Tuple
+import time
 
 # ---------- CONFIG ----------
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
@@ -17,6 +22,70 @@ def get_supabase() -> Client:
 
 supabase = get_supabase()
 
+# ---------- STRUCTURED LOGGING ----------
+class StructuredLogger:
+    """Structured logging with different log levels and JSON output"""
+    
+    LOG_LEVELS = {
+        "DEBUG": 10,
+        "INFO": 20,
+        "WARNING": 30,
+        "ERROR": 40,
+        "CRITICAL": 50
+    }
+    
+    def __init__(self, app_name="inventory_app", min_level="INFO"):
+        self.app_name = app_name
+        self.min_level = self.LOG_LEVELS.get(min_level, 20)
+        self.logs = []
+    
+    def _log(self, level: str, message: str, extra: Dict = None):
+        """Internal logging method"""
+        if self.LOG_LEVELS.get(level, 0) < self.min_level:
+            return
+        
+        log_entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "app": self.app_name,
+            "level": level,
+            "message": message,
+            "extra": extra or {}
+        }
+        self.logs.append(log_entry)
+        
+        # Also print to console for debugging
+        print(f"[{log_entry['timestamp']}] {level}: {message}")
+        if extra:
+            print(f"  Extra: {json.dumps(extra, default=str)}")
+    
+    def debug(self, message: str, extra: Dict = None):
+        self._log("DEBUG", message, extra)
+    
+    def info(self, message: str, extra: Dict = None):
+        self._log("INFO", message, extra)
+    
+    def warning(self, message: str, extra: Dict = None):
+        self._log("WARNING", message, extra)
+    
+    def error(self, message: str, extra: Dict = None):
+        self._log("ERROR", message, extra)
+    
+    def critical(self, message: str, extra: Dict = None):
+        self._log("CRITICAL", message, extra)
+    
+    def get_logs(self, level: str = None) -> List[Dict]:
+        """Get logs filtered by level"""
+        if level:
+            return [log for log in self.logs if log['level'] == level]
+        return self.logs
+    
+    def export_logs(self) -> str:
+        """Export logs as JSON string"""
+        return json.dumps(self.logs, indent=2, default=str)
+
+# Initialize logger
+logger = StructuredLogger(min_level="INFO")
+
 # ---------- CACHE MANAGEMENT ----------
 class CacheManager:
     """Centralized cache management with invalidation"""
@@ -25,6 +94,7 @@ class CacheManager:
     @staticmethod
     def invalidate_all():
         """Invalidate all cached functions"""
+        logger.info("Invalidating all caches")
         for key in list(CacheManager._cache_keys):
             try:
                 st.cache_data.clear()
@@ -43,7 +113,6 @@ def cached_with_invalidation(ttl=300, key_prefix=""):
         def wrapper(*args, **kwargs):
             return func(*args, **kwargs)
         
-        # Register the function for invalidation
         func_name = key_prefix or func.__name__
         CacheManager.register(func_name)
         
@@ -63,12 +132,15 @@ if not st.session_state.authenticated:
     if pwd == st.secrets.get("APP_PASSWORD", "changeme"):
         st.session_state.authenticated = True
         st.session_state.user_role = "admin"
+        logger.info("Admin user authenticated")
         st.rerun()
     elif pwd == st.secrets.get("VIEWER_PASSWORD", ""):
         st.session_state.authenticated = True
         st.session_state.user_role = "viewer"
+        logger.info("Viewer user authenticated")
         st.rerun()
     elif pwd:
+        logger.warning("Failed login attempt")
         st.error("Incorrect password")
     st.stop()
 
@@ -76,19 +148,30 @@ if not st.session_state.authenticated:
 params = st.query_params
 if "alert_id" in params and "action" in params:
     alert_id = params["alert_id"]
-    supabase.table("alert_log").update({
-        "action_taken": "Marked done via email link",
-        "action_date": datetime.now(timezone.utc).isoformat()
-    }).eq("id", alert_id).execute()
-    st.success(f"✅ Alert #{alert_id} marked as done!")
-    st.query_params.clear()
-    st.rerun()
+    try:
+        supabase.table("alert_log").update({
+            "action_taken": "Marked done via email link",
+            "action_date": datetime.now(timezone.utc).isoformat()
+        }).eq("id", alert_id).execute()
+        logger.info(f"Alert {alert_id} marked as done via email link")
+        st.success(f"✅ Alert #{alert_id} marked as done!")
+        st.query_params.clear()
+        st.rerun()
+    except Exception as e:
+        logger.error(f"Failed to mark alert {alert_id} as done", {"error": str(e)})
+        st.error(f"Failed to mark alert: {str(e)}")
 
 # ---------- BRANCH SELECTOR ----------
 @cached_with_invalidation(ttl=3600, key_prefix="branches")
 def get_branches():
     """Get branches with efficient single query"""
-    return supabase.table("branches").select("id,name,code").execute().data
+    try:
+        data = supabase.table("branches").select("id,name,code").execute().data
+        logger.debug("Branches fetched successfully", {"count": len(data)})
+        return data
+    except Exception as e:
+        logger.error("Failed to fetch branches", {"error": str(e)})
+        return []
 
 @cached_with_invalidation(ttl=3600, key_prefix="branch_maps")
 def get_branch_maps():
@@ -121,18 +204,82 @@ branch_id = None if selected_branch_name == "All Branches" else branch_maps['nam
 # ---------- NAVIGATION ----------
 if st.session_state.user_role == "admin":
     pages = ["Dashboard", "Products & Inventory", "Branches", "CSV Upload", 
-             "Alerts & Advisories", "Stock & Demand Limits", "Risk & FEFO", "Transfer Suggestions"]
+             "Alerts & Advisories", "Stock & Demand Limits", "Risk & FEFO", 
+             "Transfer Suggestions", "System Logs", "Data Export"]
 else:
     pages = ["Dashboard", "Products & Inventory", "CSV Upload", 
-             "Alerts & Advisories", "Stock & Demand Limits", "Risk & FEFO", "Transfer Suggestions"]
+             "Alerts & Advisories", "Stock & Demand Limits", "Risk & FEFO", 
+             "Transfer Suggestions", "Data Export"]
 
 page = st.sidebar.radio("Go to", pages)
+
+# ---------- RESPONSIVE DESIGN HELPERS ----------
+def responsive_columns(content_list, cols_per_row=2):
+    """Create responsive columns based on screen size"""
+    cols = st.columns(cols_per_row)
+    for idx, content in enumerate(content_list):
+        col_idx = idx % cols_per_row
+        with cols[col_idx]:
+            content()
+
+def mobile_friendly_table(df, max_height=400):
+    """Display a mobile-friendly table with scrolling"""
+    return st.dataframe(df, use_container_width=True, height=max_height)
+
+# ---------- PROGRESS INDICATOR ----------
+class ProgressIndicator:
+    """Custom progress indicator with detailed status updates"""
+    
+    def __init__(self, total_steps: int, description: str = "Processing..."):
+        self.total_steps = total_steps
+        self.current_step = 0
+        self.description = description
+        self.progress_bar = None
+        self.status_text = None
+        self.start_time = time.time()
+    
+    def __enter__(self):
+        """Initialize progress display"""
+        self.progress_bar = st.progress(0)
+        self.status_text = st.empty()
+        self.status_text.text(f"{self.description} (0/{self.total_steps})")
+        return self
+    
+    def update(self, step: int = 1, status: str = None):
+        """Update progress"""
+        self.current_step += step
+        progress = min(self.current_step / self.total_steps, 1.0)
+        
+        if self.progress_bar:
+            self.progress_bar.progress(progress)
+        
+        if self.status_text:
+            elapsed = time.time() - self.start_time
+            eta = (elapsed / self.current_step) * (self.total_steps - self.current_step) if self.current_step > 0 else 0
+            
+            status_msg = status or f"Processing... ({self.current_step}/{self.total_steps})"
+            if self.current_step < self.total_steps:
+                self.status_text.text(f"{status_msg} | ETA: {eta:.1f}s")
+            else:
+                self.status_text.text(f"✅ Complete! ({self.total_steps} items processed in {elapsed:.1f}s)")
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Clean up progress display"""
+        if exc_type:
+            self.status_text.error(f"❌ Error: {str(exc_val)}")
+        else:
+            self.status_text.text(f"✅ Complete! {self.total_steps} items processed in {time.time() - self.start_time:.1f}s")
+        
+        # Keep progress bar at 100%
+        if self.progress_bar:
+            self.progress_bar.progress(1.0)
 
 # ---------- HELPERS ----------
 def validate_csv_columns(df, required_cols, label="CSV"):
     """Validate CSV has required columns with better error messages"""
     missing = required_cols - set(df.columns)
     if missing:
+        logger.warning(f"Missing columns in {label}", {"missing": list(missing)})
         return False, f"❌ Missing columns in {label}: {', '.join(missing)}"
     return True, ""
 
@@ -155,35 +302,54 @@ def validate_expiry_date(expiry_date):
     return expiry_date >= today
 
 def upload_with_transaction(table_name, records, batch_size=500):
-    """Upload with transaction-like behavior"""
+    """Upload with transaction-like behavior and progress tracking"""
     if not records:
+        logger.info(f"No records to upload to {table_name}")
         return True, None, 0
     
     total_records = len(records)
     successful = 0
+    failed_records = []
     
-    for i in range(0, total_records, batch_size):
-        batch = records[i:i+batch_size]
-        batch_num = (i // batch_size) + 1
-        total_batches = (total_records + batch_size - 1) // batch_size
-        
-        try:
-            batch_clean = []
-            for rec in batch:
-                rec_clean = {}
-                for k, v in rec.items():
-                    if isinstance(v, (date, datetime)):
-                        rec_clean[k] = v.isoformat()
-                    elif isinstance(v, pd.Timestamp):
-                        rec_clean[k] = v.isoformat()
-                    else:
-                        rec_clean[k] = v
-                batch_clean.append(rec_clean)
+    with ProgressIndicator((total_records + batch_size - 1) // batch_size, f"Uploading to {table_name}") as progress:
+        for i in range(0, total_records, batch_size):
+            batch = records[i:i+batch_size]
+            batch_num = (i // batch_size) + 1
+            total_batches = (total_records + batch_size - 1) // batch_size
             
-            supabase.table(table_name).insert(batch_clean).execute()
-            successful += len(batch)
-        except Exception as e:
-            return False, f"Upload failed at batch {batch_num}/{total_batches}. Error: {str(e)}", successful
+            try:
+                batch_clean = []
+                for rec in batch:
+                    rec_clean = {}
+                    for k, v in rec.items():
+                        if isinstance(v, (date, datetime)):
+                            rec_clean[k] = v.isoformat()
+                        elif isinstance(v, pd.Timestamp):
+                            rec_clean[k] = v.isoformat()
+                        else:
+                            rec_clean[k] = v
+                    batch_clean.append(rec_clean)
+                
+                supabase.table(table_name).insert(batch_clean).execute()
+                successful += len(batch)
+                logger.debug(f"Uploaded batch {batch_num}/{total_batches} to {table_name}", 
+                           {"batch_size": len(batch), "successful": successful})
+                progress.update(status=f"Batch {batch_num}/{total_batches} - {successful}/{total_records} records")
+                
+            except Exception as e:
+                error_detail = {
+                    "table": table_name,
+                    "batch": batch_num,
+                    "batch_size": len(batch),
+                    "error": str(e),
+                    "traceback": traceback.format_exc()
+                }
+                logger.error(f"Upload failed at batch {batch_num}", error_detail)
+                failed_records.extend(batch)
+                return False, f"Upload failed at batch {batch_num}/{total_batches}. Error: {str(e)}", successful
+    
+    if failed_records:
+        logger.warning(f"Some records failed to upload", {"failed_count": len(failed_records)})
     
     return True, None, successful
 
@@ -198,6 +364,7 @@ def bulk_upsert_products(products_data, batch_size=200):
             invalid_skus.append(p.get('sku', 'unknown'))
     
     if invalid_skus:
+        logger.error("Invalid SKU formats", {"invalid_skus": invalid_skus[:10]})
         return False, f"Invalid SKU format in: {', '.join(invalid_skus[:10])}", 0, 0
     
     sku_map = {}
@@ -218,24 +385,28 @@ def bulk_upsert_products(products_data, batch_size=200):
     created_count = 0
     updated_count = 0
     
-    for i in range(0, len(unique_products), batch_size):
-        batch = unique_products[i:i+batch_size]
-        for product in batch:
-            sku = product['sku']
-            if sku in existing_skus:
+    with ProgressIndicator(len(unique_products), "Processing products") as progress:
+        for i in range(0, len(unique_products), batch_size):
+            batch = unique_products[i:i+batch_size]
+            for product in batch:
+                sku = product['sku']
                 try:
-                    product_clean = {k: v for k, v in product.items() if k != 'id'}
-                    supabase.table("products").update(product_clean).eq("sku", sku).execute()
-                    updated_count += 1
+                    if sku in existing_skus:
+                        product_clean = {k: v for k, v in product.items() if k != 'id'}
+                        supabase.table("products").update(product_clean).eq("sku", sku).execute()
+                        updated_count += 1
+                        logger.debug(f"Updated product", {"sku": sku})
+                    else:
+                        product_clean = {k: v for k, v in product.items() if k != 'id'}
+                        supabase.table("products").insert(product_clean).execute()
+                        created_count += 1
+                        logger.debug(f"Created product", {"sku": sku})
+                    
+                    progress.update(status=f"Processed {sku}")
+                    
                 except Exception as e:
-                    return False, f"Update failed for SKU {sku}: {str(e)}", created_count, updated_count
-            else:
-                try:
-                    product_clean = {k: v for k, v in product.items() if k != 'id'}
-                    supabase.table("products").insert(product_clean).execute()
-                    created_count += 1
-                except Exception as e:
-                    return False, f"Insert failed for SKU {sku}: {str(e)}", created_count, updated_count
+                    logger.error(f"Failed to process product {sku}", {"error": str(e)})
+                    return False, f"Failed to process SKU {sku}: {str(e)}", created_count, updated_count
     
     return True, None, created_count, updated_count
 
@@ -286,6 +457,7 @@ def ensure_products_exist(skus, default_cost=0.0, default_shelf_life=90):
     if missing:
         invalid_skus = [sku for sku in missing if not validate_sku_format(sku)]
         if invalid_skus:
+            logger.error("Invalid SKU format in missing products", {"invalid_skus": invalid_skus[:10]})
             st.error(f"❌ Invalid SKU format in: {', '.join(invalid_skus[:10])}")
             return {}
         
@@ -301,11 +473,13 @@ def ensure_products_exist(skus, default_cost=0.0, default_shelf_life=90):
         
         success, error, created, updated = bulk_upsert_products(new_products)
         if not success:
+            logger.error("Failed to create products", {"error": error})
             st.error(f"❌ Failed to create products: {error}")
             return {}
         
         CacheManager.invalidate_all()
         sku_to_id.update(chunked_sku_lookup(missing))
+        logger.info(f"Auto-created products", {"count": len(missing)})
         st.warning(f"⚠️ Auto-created {len(missing)} missing product(s) with default values. Please review and update them later.")
     
     return sku_to_id
@@ -324,47 +498,48 @@ def search_products(search_term, branch_id=None, limit=100):
     if not search_term:
         return []
     
-    # First, find matching products
-    product_query = supabase.table("products").select(
-        "id,sku,name,category,shelf_life_days,cost"
-    ).or_(
-        f"sku.ilike.%{search_term}%,name.ilike.%{search_term}%"
-    ).limit(limit)
-    
-    products = product_query.execute().data
-    
-    if not products:
-        return []
-    
-    # Get inventory for these products if branch is selected
-    product_ids = [p['id'] for p in products]
-    
-    if branch_id:
-        inventory_query = supabase.table("view_inventory_list").select(
-            "product_id,batch,quantity,expiry_date,storage_location"
-        ).in_("product_id", product_ids).eq("branch_id", branch_id)
-        inventory = inventory_query.execute().data
+    try:
+        product_query = supabase.table("products").select(
+            "id,sku,name,category,shelf_life_days,cost"
+        ).or_(
+            f"sku.ilike.%{search_term}%,name.ilike.%{search_term}%"
+        ).limit(limit)
         
-        # Group inventory by product_id
-        inv_by_product = {}
-        for inv in inventory:
-            prod_id = inv['product_id']
-            if prod_id not in inv_by_product:
-                inv_by_product[prod_id] = []
-            inv_by_product[prod_id].append(inv)
+        products = product_query.execute().data
         
-        # Add inventory to products
-        for product in products:
-            product['inventory'] = inv_by_product.get(product['id'], [])
-    else:
-        # Show all branches inventory
-        for product in products:
+        if not products:
+            return []
+        
+        product_ids = [p['id'] for p in products]
+        
+        if branch_id:
             inventory_query = supabase.table("view_inventory_list").select(
-                "branch_name,batch,quantity,expiry_date,storage_location"
-            ).eq("product_id", product['id'])
-            product['inventory'] = inventory_query.execute().data
-    
-    return products
+                "product_id,batch,quantity,expiry_date,storage_location"
+            ).in_("product_id", product_ids).eq("branch_id", branch_id)
+            inventory = inventory_query.execute().data
+            
+            inv_by_product = {}
+            for inv in inventory:
+                prod_id = inv['product_id']
+                if prod_id not in inv_by_product:
+                    inv_by_product[prod_id] = []
+                inv_by_product[prod_id].append(inv)
+            
+            for product in products:
+                product['inventory'] = inv_by_product.get(product['id'], [])
+        else:
+            for product in products:
+                inventory_query = supabase.table("view_inventory_list").select(
+                    "branch_name,batch,quantity,expiry_date,storage_location"
+                ).eq("product_id", product['id'])
+                product['inventory'] = inventory_query.execute().data
+        
+        logger.debug(f"Product search completed", {"term": search_term, "results": len(products)})
+        return products
+        
+    except Exception as e:
+        logger.error("Product search failed", {"term": search_term, "error": str(e)})
+        return []
 
 def search_inventory(search_term, branch_id=None, limit=100):
     """Search inventory by product SKU, name, or batch"""
@@ -372,47 +547,84 @@ def search_inventory(search_term, branch_id=None, limit=100):
     if not search_term:
         return []
     
-    query = supabase.table("view_inventory_list").select(
-        "id,branch_id,branch_name,product_id,product_name,sku,batch,quantity,expiry_date,storage_location,cost"
-    )
+    try:
+        query = supabase.table("view_inventory_list").select(
+            "id,branch_id,branch_name,product_id,product_name,sku,batch,quantity,expiry_date,storage_location,cost"
+        )
+        
+        if branch_id:
+            query = query.eq("branch_id", branch_id)
+        
+        query = query.or_(
+            f"sku.ilike.%{search_term}%,product_name.ilike.%{search_term}%,batch.ilike.%{search_term}%"
+        ).limit(limit)
+        
+        results = query.execute().data
+        logger.debug(f"Inventory search completed", {"term": search_term, "results": len(results)})
+        return results
+        
+    except Exception as e:
+        logger.error("Inventory search failed", {"term": search_term, "error": str(e)})
+        return []
+
+# ---------- DATA EXPORT ----------
+def export_data_to_csv(data: List[Dict], filename: str = "export.csv") -> bytes:
+    """Export data to CSV and return as bytes"""
+    if not data:
+        return b""
     
-    if branch_id:
-        query = query.eq("branch_id", branch_id)
+    df = pd.DataFrame(data)
+    csv_buffer = io.StringIO()
+    df.to_csv(csv_buffer, index=False)
+    return csv_buffer.getvalue().encode('utf-8')
+
+def export_data_to_excel(data: List[Dict], filename: str = "export.xlsx") -> bytes:
+    """Export data to Excel and return as bytes"""
+    if not data:
+        return b""
     
-    # Search across multiple fields
-    query = query.or_(
-        f"sku.ilike.%{search_term}%,product_name.ilike.%{search_term}%,batch.ilike.%{search_term}%"
-    ).limit(limit)
-    
-    return query.execute().data
+    df = pd.DataFrame(data)
+    excel_buffer = io.BytesIO()
+    with pd.ExcelWriter(excel_buffer, engine='xlsxwriter') as writer:
+        df.to_excel(writer, sheet_name='Data', index=False)
+    return excel_buffer.getvalue()
 
 # ============================================================
 # PAGE: DASHBOARD
 # ============================================================
 if page == "Dashboard":
     st.header("📊 Executive Summary")
+    
+    # Responsive metrics
+    col1, col2 = st.columns(2)
+    
     if branch_id:
         total_val = supabase.rpc("get_total_value", {"branch_id_param": branch_id}).execute().data
         waste_val = supabase.rpc("get_waste_risk", {"branch_id_param": branch_id}).execute().data
     else:
         total_val = supabase.rpc("get_total_value_all").execute().data
         waste_val = supabase.rpc("get_waste_risk_all").execute().data
+    
     total_val = total_val or 0
     waste_val = waste_val or 0
-    col1, col2 = st.columns(2)
-    col1.metric("Total Inventory Value", f"₦{total_val:,.0f}")
-    col2.metric("Waste Risk (next 90d)", f"₦{waste_val:,.0f}")
+    
+    with col1:
+        st.metric("Total Inventory Value", f"₦{total_val:,.0f}")
+    with col2:
+        st.metric("Waste Risk (next 90d)", f"₦{waste_val:,.0f}")
 
     alert_query = supabase.table("alert_log").select("alert_type, action_taken")
     if branch_id:
         alert_query = alert_query.eq("branch_id", branch_id)
     alerts = alert_query.limit(1000).execute().data
+    
     if alerts:
         df_a = pd.DataFrame(alerts)
         total_alerts = len(df_a)
         actioned = df_a['action_taken'].notna().sum()
         compliance = round(actioned / total_alerts * 100, 1) if total_alerts else 0
         st.metric("Alert Compliance", f"{compliance}%")
+        
         st.subheader("Alert Type Breakdown")
         st.bar_chart(df_a['alert_type'].value_counts())
     else:
@@ -450,11 +662,12 @@ elif page == "Products & Inventory":
     with col4:
         if st.button("🔄 Refresh Data", use_container_width=True):
             CacheManager.invalidate_all()
+            logger.info("Data refreshed")
             st.rerun()
     
     st.divider()
     
-    # Initialize session state for views
+    # Initialize session state
     if "show_add_product" not in st.session_state:
         st.session_state.show_add_product = False
     if "show_all_products" not in st.session_state:
@@ -480,8 +693,10 @@ elif page == "Products & Inventory":
                     if st.form_submit_button("✅ Add Product", use_container_width=True):
                         if not new_sku or not new_name:
                             st.error("SKU and name are required.")
+                            logger.warning("Add product failed: missing SKU or name")
                         elif not validate_sku_format(new_sku):
                             st.error("Invalid SKU format. Use alphanumeric, underscores, hyphens, or periods.")
+                            logger.warning("Add product failed: invalid SKU format", {"sku": new_sku})
                         else:
                             try:
                                 supabase.table("products").insert({
@@ -492,10 +707,12 @@ elif page == "Products & Inventory":
                                     "cost": new_cost
                                 }).execute()
                                 st.success(f"✅ Product '{new_name}' added successfully!")
+                                logger.info(f"Product added", {"sku": new_sku, "name": new_name})
                                 CacheManager.invalidate_all()
                                 st.session_state.show_add_product = False
                                 st.rerun()
                             except Exception as e:
+                                logger.error(f"Failed to add product", {"sku": new_sku, "error": str(e)})
                                 st.error(f"Failed to add product: {e}")
                 with col2:
                     if st.form_submit_button("❌ Cancel", use_container_width=True):
@@ -505,7 +722,9 @@ elif page == "Products & Inventory":
     # Search results or default views
     if search_term:
         if search_type == "Products":
-            results = search_products(search_term, branch_id)
+            with st.spinner(f"Searching for '{search_term}'..."):
+                results = search_products(search_term, branch_id)
+            
             if results:
                 st.success(f"Found {len(results)} products matching '{search_term}'")
                 for product in results:
@@ -523,7 +742,6 @@ elif page == "Products & Inventory":
                             if st.button(f"✏️ Edit {product['sku']}", key=f"edit_{product['id']}"):
                                 st.session_state.edit_product = product
                         
-                        # Show inventory for this product
                         if product.get('inventory'):
                             st.subheader("Inventory Locations")
                             inv_df = pd.DataFrame(product['inventory'])
@@ -531,38 +749,43 @@ elif page == "Products & Inventory":
                                 display_cols = ['branch_name', 'batch', 'quantity', 'expiry_date', 'storage_location']
                             else:
                                 display_cols = ['batch', 'quantity', 'expiry_date', 'storage_location']
-                            st.dataframe(inv_df[display_cols])
+                            mobile_friendly_table(inv_df[display_cols])
             else:
                 st.info(f"No products found matching '{search_term}'")
         
         else:  # Search inventory
-            results = search_inventory(search_term, branch_id)
+            with st.spinner(f"Searching inventory for '{search_term}'..."):
+                results = search_inventory(search_term, branch_id)
+            
             if results:
                 st.success(f"Found {len(results)} inventory records matching '{search_term}'")
                 df_results = pd.DataFrame(results)
                 df_results['expiry_display'] = df_results['expiry_date'].apply(lambda x: x if pd.notna(x) else "No expiry")
-                st.dataframe(df_results[['branch_name', 'product_name', 'sku', 'batch', 'quantity', 'expiry_display', 'storage_location']])
+                mobile_friendly_table(df_results[['branch_name', 'product_name', 'sku', 'batch', 'quantity', 'expiry_display', 'storage_location']])
                 
                 # Quick action: Adjust inventory
                 st.subheader("⚡ Quick Inventory Adjustment")
                 selected_item = st.selectbox("Select inventory item to adjust", 
                                            [f"{row['sku']} - {row['batch']}" for row in results])
                 if selected_item:
-                    selected_row = results[[f"{row['sku']} - {row['batch']}" == selected_item for row in results].index(True)]
+                    selected_index = [f"{row['sku']} - {row['batch']}" == selected_item for row in results].index(True)
+                    selected_row = results[selected_index]
                     new_qty = st.number_input("New Quantity", min_value=0, value=selected_row['quantity'])
                     if st.button("Update Quantity"):
                         try:
                             supabase.table("inventory").update({"quantity": new_qty}).eq("id", selected_row['id']).execute()
                             st.success("✅ Inventory updated!")
+                            logger.info(f"Inventory updated", {"id": selected_row['id'], "new_qty": new_qty})
                             CacheManager.invalidate_all()
                             st.rerun()
                         except Exception as e:
+                            logger.error(f"Failed to update inventory", {"id": selected_row['id'], "error": str(e)})
                             st.error(f"Failed to update: {e}")
             else:
                 st.info(f"No inventory records found matching '{search_term}'")
     
     else:
-        # Default view: Show products or inventory based on session state
+        # Default view
         if st.session_state.show_inventory:
             st.subheader("📊 All Inventory")
             PAGE_SIZE = 50
@@ -584,7 +807,7 @@ elif page == "Products & Inventory":
             if inv_data:
                 df_i = pd.DataFrame(inv_data)
                 df_i['expiry_display'] = df_i['expiry_date'].apply(lambda x: x if pd.notna(x) else "No expiry")
-                st.dataframe(df_i[['branch_name','product_name','sku','batch','quantity','expiry_display','storage_location']].rename(columns={
+                mobile_friendly_table(df_i[['branch_name','product_name','sku','batch','quantity','expiry_display','storage_location']].rename(columns={
                     'branch_name':'Branch','product_name':'Product','expiry_display':'Expiry Date'
                 }))
                 
@@ -612,14 +835,12 @@ elif page == "Products & Inventory":
             prods = supabase.table("products").select("id,sku,name,category,shelf_life_days,cost").range(offset, offset+PAGE_SIZE-1).execute().data
             
             if prods:
-                # Add edit functionality directly in the dataframe display
                 df_p = pd.DataFrame(prods)
-                st.dataframe(df_p[['sku','name','category','shelf_life_days','cost']])
+                mobile_friendly_table(df_p[['sku','name','category','shelf_life_days','cost']])
                 
                 col1, col2 = st.columns(2)
                 if col1.button("⬅️ Prev", disabled=st.session_state.prod_page==0):
-                    st.session_state.prod_page -= 1
-                    st.rerun()
+                    st.session_state.prod_page -= 1                    st.rerun()
                 if col2.button("Next ➡️", disabled=st.session_state.prod_page>=total_pages-1):
                     st.session_state.prod_page += 1
                     st.rerun()
@@ -650,22 +871,25 @@ elif page == "Products & Inventory":
                                         "cost": new_cost
                                     }).eq("id", product['id']).execute()
                                     st.success("✅ Product updated successfully!")
+                                    logger.info(f"Product updated", {"sku": edit_sku})
                                     CacheManager.invalidate_all()
                                     st.rerun()
                                 except Exception as e:
+                                    logger.error(f"Failed to update product", {"sku": edit_sku, "error": str(e)})
                                     st.error(f"Failed to update: {e}")
                         with col2:
                             if st.form_submit_button("🗑️ Delete Product", use_container_width=True):
-                                if st.warning("Are you sure? This will delete the product and all associated inventory."):
+                                st.warning("⚠️ Warning: This will delete the product and all associated inventory.")
+                                if st.checkbox("Confirm deletion"):
                                     try:
-                                        # Delete inventory first
                                         supabase.table("inventory").delete().eq("product_id", product['id']).execute()
-                                        # Then delete product
                                         supabase.table("products").delete().eq("id", product['id']).execute()
                                         st.success("✅ Product and associated inventory deleted.")
+                                        logger.info(f"Product deleted", {"sku": edit_sku})
                                         CacheManager.invalidate_all()
                                         st.rerun()
                                     except Exception as e:
+                                        logger.error(f"Failed to delete product", {"sku": edit_sku, "error": str(e)})
                                         st.error(f"Failed to delete: {e}")
             else:
                 st.info("No products found. Add your first product above!")
@@ -676,10 +900,13 @@ elif page == "Products & Inventory":
 elif page == "Branches":
     if st.session_state.user_role != "admin":
         st.error("Permission denied.")
+        logger.warning("Unauthorized access attempt to Branches page")
         st.stop()
+    
     st.header("🏢 Branch Management")
     st.markdown("Edit branch details below. No deletion is allowed.")
     branches = get_branches()
+    
     if not branches:
         st.info("No branches found. Use 'Add Branch' below.")
     else:
@@ -696,6 +923,7 @@ elif page == "Branches":
                         new_inventory = st.text_input("Inventory Email", value=branch.get('inventory_email', ''))
                         new_auditor = st.text_input("Auditor Email", value=branch.get('auditor_email', ''))
                         new_manager = st.text_input("Manager Email", value=branch.get('manager_email', ''))
+                    
                     submitted = st.form_submit_button("💾 Save Changes")
                     if submitted:
                         update_data = {}
@@ -713,16 +941,20 @@ elif page == "Branches":
                             update_data['auditor_email'] = new_auditor or None
                         if new_manager != branch.get('manager_email', ''):
                             update_data['manager_email'] = new_manager or None
+                        
                         if update_data:
                             try:
                                 supabase.table("branches").update(update_data).eq("id", branch['id']).execute()
                                 st.success(f"✅ Branch '{new_name}' updated.")
+                                logger.info(f"Branch updated", {"id": branch['id'], "name": new_name})
                                 CacheManager.invalidate_all()
                                 st.rerun()
                             except Exception as e:
+                                logger.error(f"Failed to update branch", {"id": branch['id'], "error": str(e)})
                                 st.error(f"Update failed: {e}")
                         else:
                             st.info("No changes made.")
+    
     st.markdown("---")
     st.subheader("➕ Add New Branch")
     with st.form("add_branch_form"):
@@ -736,10 +968,12 @@ elif page == "Branches":
             inventory_email = st.text_input("Inventory Email")
             auditor_email = st.text_input("Auditor Email")
             manager_email = st.text_input("Manager Email")
+        
         submitted = st.form_submit_button("Add Branch")
         if submitted:
             if not name or not code:
                 st.error("Name and code are required.")
+                logger.warning("Add branch failed: missing name or code")
             else:
                 try:
                     supabase.table("branches").insert({
@@ -752,17 +986,22 @@ elif page == "Branches":
                         "manager_email": manager_email or None
                     }).execute()
                     st.success(f"Branch '{name}' added.")
+                    logger.info(f"Branch added", {"name": name, "code": code})
                     CacheManager.invalidate_all()
                     st.rerun()
                 except Exception as e:
+                    logger.error(f"Failed to add branch", {"name": name, "error": str(e)})
                     st.error(f"Failed: {e}")
+    
     st.markdown("---")
     st.subheader("📁 Bulk Upload Branches CSV")
     st.markdown("**CSV columns:** `name`, `code`, `storekeeper_email`, `procurement_email`, `inventory_email`, `auditor_email`, `manager_email`")
     st.info("📌 Recommended max rows: 500. Upload is chunked (500 rows per batch).")
+    
     template_df = pd.DataFrame(columns=['name','code','storekeeper_email','procurement_email','inventory_email','auditor_email','manager_email'])
     csv = template_df.to_csv(index=False)
     st.download_button("📥 Download Branch Template", csv, "branches_template.csv", "text/csv")
+    
     uploaded_file = st.file_uploader("Choose branches CSV", type="csv", key="branches_csv")
     if uploaded_file:
         df = pd.read_csv(uploaded_file)
@@ -772,37 +1011,40 @@ elif page == "Branches":
         if not is_valid:
             st.error(msg)
             st.stop()
+        
         for col in ['storekeeper_email','procurement_email','inventory_email','auditor_email','manager_email']:
             if col not in df.columns:
                 df[col] = None
+        
         if st.button("Upload Branches"):
             records = df[['name','code','storekeeper_email','procurement_email','inventory_email','auditor_email','manager_email']].to_dict(orient="records")
             success, err, count = upload_with_transaction("branches", records)
             if success:
                 st.success(f"Branches uploaded! {count} rows processed.")
+                logger.info(f"Branches uploaded", {"count": count})
                 CacheManager.invalidate_all()
                 st.rerun()
             else:
                 st.error(err)
 
 # ============================================================
-# PAGE: CSV UPLOAD (with search for products)
+# PAGE: CSV UPLOAD
 # ============================================================
 elif page == "CSV Upload":
     st.header("📁 Upload Inventory or Movement Data")
     
-    # Quick search for products before upload
     with st.expander("🔍 Search Products Before Upload", expanded=False):
         search_term = st.text_input("Search products", placeholder="SKU or product name", key="upload_search")
         if search_term:
-            results = search_products(search_term, branch_id, limit=20)
+            with st.spinner("Searching..."):
+                results = search_products(search_term, branch_id, limit=20)
             if results:
-                st.dataframe(pd.DataFrame(results)[['sku', 'name', 'category', 'cost']])
+                mobile_friendly_table(pd.DataFrame(results)[['sku', 'name', 'category', 'cost']])
             else:
                 st.info("No products found")
     
     upload_type = st.selectbox("Data Type", ["Inventory (current stock)", "Stock Movements (sales/restock)"])
-
+    
     if upload_type == "Inventory (current stock)":
         st.markdown("""
         ### 📋 Required CSV Headers for Inventory
@@ -811,7 +1053,7 @@ elif page == "CSV Upload":
         - `quantity` – integer
         - `expiry_date` – YYYY-MM-DD (leave blank for non‑expiring items)
         - `storage_location` – warehouse / shelf / cold_room
-
+        
         ⚠️ **Recommended max rows:** 5,000 per upload (chunked automatically).  
         ✅ **Missing SKUs will be auto‑created** as placeholder products (you can edit them later).  
         ✅ **Expiry dates must be in the future** (or blank for non-expiring items).
@@ -827,7 +1069,7 @@ elif page == "CSV Upload":
         - `quantity_change` – integer (negative = sale, positive = restock)
         - `movement_date` – YYYY-MM-DD
         - `notes` – optional text
-
+        
         ⚠️ **Recommended max rows:** 10,000 per upload (chunked automatically).  
         ❗ Movements require that the SKU already exists in products (no auto‑creation).
         """)
@@ -835,8 +1077,9 @@ elif page == "CSV Upload":
         template_df.loc[0] = ['SKU12345', -5, '2026-05-17', 'Daily sales']
         csv_template = template_df.to_csv(index=False)
         st.download_button("📥 Download Movements CSV Template", csv_template, "movements_template.csv", "text/csv")
-
+    
     st.markdown("---")
+    
     if branch_id:
         selected_branch_id = branch_id
         selected_branch_label = selected_branch_name
@@ -845,87 +1088,98 @@ elif page == "CSV Upload":
         branch_map = {b['name']: b['id'] for b in branch_list}
         selected_branch_label = st.selectbox("Select branch for data", list(branch_map.keys()))
         selected_branch_id = branch_map[selected_branch_label]
-
+    
     uploaded_file = st.file_uploader("Choose CSV", type="csv", key="data_csv")
+    
     if uploaded_file:
         df = pd.read_csv(uploaded_file)
         st.dataframe(df.head())
+        
         if upload_type == "Inventory (current stock)":
             required_cols = {'product_sku','batch','quantity','expiry_date','storage_location'}
             is_valid, msg = validate_csv_columns(df, required_cols, "inventory CSV")
             if not is_valid:
                 st.error(msg)
                 st.stop()
-
-            df['product_sku'] = df['product_sku'].astype(str).str.strip()
-            df = df[df['product_sku'].notna() & (df['product_sku'] != '')]
-            df['quantity'] = pd.to_numeric(df['quantity'], errors='coerce').fillna(0).astype(int).clip(lower=0)
             
-            df['expiry_date_raw'] = df['expiry_date']
-            df['expiry_date'] = pd.to_datetime(df['expiry_date'], errors='coerce').dt.date
-            
-            invalid_expiry = df[df['expiry_date'].notna() & (df['expiry_date'] < date.today())]
-            if not invalid_expiry.empty:
-                st.error(f"❌ {len(invalid_expiry)} rows have expiry dates in the past. Please correct them.")
-                st.dataframe(invalid_expiry[['product_sku', 'batch', 'expiry_date_raw']])
-                st.stop()
-            
-            df['expiry_date'] = df['expiry_date'].where(pd.notna(df['expiry_date']), None)
-
-            skus = df['product_sku'].unique().tolist()
-            sku_to_id = ensure_products_exist(skus)
-            if not sku_to_id:
-                st.error("❌ Failed to create or find products. Please check SKU formats.")
-                st.stop()
+            with st.spinner("Processing inventory data..."):
+                df['product_sku'] = df['product_sku'].astype(str).str.strip()
+                df = df[df['product_sku'].notna() & (df['product_sku'] != '')]
+                df['quantity'] = pd.to_numeric(df['quantity'], errors='coerce').fillna(0).astype(int).clip(lower=0)
                 
-            df['product_id'] = df['product_sku'].map(sku_to_id)
-            if df['product_id'].isna().any():
-                missing_after = df[df['product_id'].isna()]['product_sku'].unique()
-                st.error(f"❌ SKUs could not be matched or created: {missing_after}. Please check product master.")
-                st.stop()
-
-            df['branch_id'] = selected_branch_id
-            df = df[['branch_id','product_id','batch','quantity','expiry_date','storage_location']]
-
+                df['expiry_date_raw'] = df['expiry_date']
+                df['expiry_date'] = pd.to_datetime(df['expiry_date'], errors='coerce').dt.date
+                
+                invalid_expiry = df[df['expiry_date'].notna() & (df['expiry_date'] < date.today())]
+                if not invalid_expiry.empty:
+                    logger.warning("Invalid expiry dates found", {"count": len(invalid_expiry)})
+                    st.error(f"❌ {len(invalid_expiry)} rows have expiry dates in the past. Please correct them.")
+                    st.dataframe(invalid_expiry[['product_sku', 'batch', 'expiry_date_raw']])
+                    st.stop()
+                
+                df['expiry_date'] = df['expiry_date'].where(pd.notna(df['expiry_date']), None)
+                
+                skus = df['product_sku'].unique().tolist()
+                sku_to_id = ensure_products_exist(skus)
+                
+                if not sku_to_id:
+                    st.error("❌ Failed to create or find products. Please check SKU formats.")
+                    st.stop()
+                    
+                df['product_id'] = df['product_sku'].map(sku_to_id)
+                if df['product_id'].isna().any():
+                    missing_after = df[df['product_id'].isna()]['product_sku'].unique()
+                    logger.error("SKUs could not be matched", {"missing": list(missing_after)})
+                    st.error(f"❌ SKUs could not be matched or created: {missing_after}. Please check product master.")
+                    st.stop()
+                
+                df['branch_id'] = selected_branch_id
+                df = df[['branch_id','product_id','batch','quantity','expiry_date','storage_location']]
+            
             if st.button("Upload Inventory"):
                 records = df.to_dict(orient="records")
                 success, err, count = upload_with_transaction("inventory", records)
                 if success:
                     st.success(f"Inventory uploaded for {selected_branch_label}! {count} rows processed.")
+                    logger.info(f"Inventory uploaded", {"branch": selected_branch_label, "count": count})
                     CacheManager.invalidate_all()
                 else:
                     st.error(err)
-
+        
         else:  # movements
             required_cols = {'product_sku','quantity_change','movement_date'}
             is_valid, msg = validate_csv_columns(df, required_cols, "movements CSV")
             if not is_valid:
                 st.error(msg)
                 st.stop()
-
-            df['product_sku'] = df['product_sku'].astype(str).str.strip()
-            df = df[df['product_sku'].notna() & (df['product_sku'] != '')]
-            df['quantity_change'] = pd.to_numeric(df['quantity_change'], errors='coerce').fillna(0).astype(int)
-
-            skus = df['product_sku'].unique().tolist()
-            sku_to_id = chunked_sku_lookup(skus)
-            df['product_id'] = df['product_sku'].map(sku_to_id)
-            missing = df[df['product_id'].isna()]['product_sku'].unique()
-            if len(missing) > 0:
-                st.error(f"❌ SKUs not found in products table: {missing}. Please add them first (or use Inventory upload to auto‑create).")
-                st.stop()
-
-            df['branch_id'] = selected_branch_id
-            df['movement_date'] = pd.to_datetime(df['movement_date']).dt.date
-            if 'notes' not in df.columns:
-                df['notes'] = ""
-            df = df[['branch_id','product_id','quantity_change','movement_date','notes']]
-
+            
+            with st.spinner("Processing movement data..."):
+                df['product_sku'] = df['product_sku'].astype(str).str.strip()
+                df = df[df['product_sku'].notna() & (df['product_sku'] != '')]
+                df['quantity_change'] = pd.to_numeric(df['quantity_change'], errors='coerce').fillna(0).astype(int)
+                
+                skus = df['product_sku'].unique().tolist()
+                sku_to_id = chunked_sku_lookup(skus)
+                df['product_id'] = df['product_sku'].map(sku_to_id)
+                missing = df[df['product_id'].isna()]['product_sku'].unique()
+                
+                if len(missing) > 0:
+                    logger.error("SKUs not found in products", {"missing": list(missing)})
+                    st.error(f"❌ SKUs not found in products table: {missing}. Please add them first (or use Inventory upload to auto‑create).")
+                    st.stop()
+                
+                df['branch_id'] = selected_branch_id
+                df['movement_date'] = pd.to_datetime(df['movement_date']).dt.date
+                if 'notes' not in df.columns:
+                    df['notes'] = ""
+                df = df[['branch_id','product_id','quantity_change','movement_date','notes']]
+            
             if st.button("Upload Movements"):
                 records = df.to_dict(orient="records")
                 success, err, count = upload_with_transaction("stock_movements", records)
                 if success:
                     st.success(f"Movements uploaded for {selected_branch_label}! {count} rows processed.")
+                    logger.info(f"Movements uploaded", {"branch": selected_branch_label, "count": count})
                     CacheManager.invalidate_all()
                 else:
                     st.error(err)
@@ -946,24 +1200,24 @@ elif page == "Alerts & Advisories":
     if "alert_page" not in st.session_state:
         st.session_state.alert_page = 0
     offset = st.session_state.alert_page * PAGE_SIZE
-
+    
     total = get_cached_count("alert_log", filter_col="branch_id" if branch_id else None,
                              filter_val=branch_id if branch_id else None)
     total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
-
+    
     query = supabase.table("alert_log").select("id,branch_id,product_id,batch,alert_type,details,action_taken,created_at,products(name),branches(name)").order("created_at", desc=True)
     if branch_id:
         query = query.eq("branch_id", branch_id)
     alerts = query.range(offset, offset+PAGE_SIZE-1).execute().data
-
+    
     if alerts:
         df_al = pd.DataFrame(alerts)
         df_al['product'] = df_al['products'].apply(lambda x: x['name'] if x else '')
         df_al['branch'] = df_al['branches'].apply(lambda x: x['name'] if x else '')
-        st.dataframe(df_al[['branch','product','batch','alert_type','details','action_taken','created_at']])
+        mobile_friendly_table(df_al[['branch','product','batch','alert_type','details','action_taken','created_at']])
     else:
         st.info("No alerts.")
-
+    
     col1, col2 = st.columns(2)
     if col1.button("Prev Alerts", disabled=st.session_state.alert_page==0):
         st.session_state.alert_page -= 1
@@ -972,20 +1226,25 @@ elif page == "Alerts & Advisories":
         st.session_state.alert_page += 1
         st.rerun()
     st.caption(f"Page {st.session_state.alert_page+1} of {total_pages}")
-
+    
     unactioned = [a for a in alerts if not a.get('action_taken')] if alerts else []
     if unactioned:
         st.subheader("Manual Action Update")
         alert_id = st.selectbox("Select Alert ID", [a['id'] for a in unactioned])
         action_text = st.text_input("Action Description")
         if st.button("Mark Done"):
-            supabase.table("alert_log").update({
-                "action_taken": action_text,
-                "action_date": datetime.now(timezone.utc).isoformat()
-            }).eq("id", alert_id).execute()
-            st.success("Marked as done.")
-            CacheManager.invalidate_all()
-            st.rerun()
+            try:
+                supabase.table("alert_log").update({
+                    "action_taken": action_text,
+                    "action_date": datetime.now(timezone.utc).isoformat()
+                }).eq("id", alert_id).execute()
+                st.success("Marked as done.")
+                logger.info(f"Alert marked as done", {"alert_id": alert_id})
+                CacheManager.invalidate_all()
+                st.rerun()
+            except Exception as e:
+                logger.error(f"Failed to mark alert as done", {"alert_id": alert_id, "error": str(e)})
+                st.error(f"Failed to update: {e}")
     elif alerts:
         st.info("All displayed alerts have been actioned.")
 
@@ -999,24 +1258,24 @@ elif page == "Stock & Demand Limits":
     if "limits_page" not in st.session_state:
         st.session_state.limits_page = 0
     offset = st.session_state.limits_page * PAGE_SIZE
-
+    
     total = get_cached_count("stock_limits", filter_col="branch_id" if branch_id else None,
                              filter_val=branch_id if branch_id else None)
     total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
-
+    
     query = supabase.table("stock_limits").select("id,branch_id,product_id,avg_daily_demand,safety_stock,reorder_point,max_stock,calculated_at,products(name),branches(name)")
     if branch_id:
         query = query.eq("branch_id", branch_id)
     limits = query.range(offset, offset+PAGE_SIZE-1).execute().data
-
+    
     if limits:
         df_l = pd.DataFrame(limits)
         df_l['product'] = df_l['products'].apply(lambda x: x['name'] if x else '')
         df_l['branch'] = df_l['branches'].apply(lambda x: x['name'] if x else '')
-        st.dataframe(df_l[['branch','product','avg_daily_demand','safety_stock','reorder_point','max_stock','calculated_at']])
+        mobile_friendly_table(df_l[['branch','product','avg_daily_demand','safety_stock','reorder_point','max_stock','calculated_at']])
     else:
         st.info("No stock limits computed yet. Ensure the daily maintenance function has run.")
-
+    
     col1, col2 = st.columns(2)
     if col1.button("Prev Limits", disabled=st.session_state.limits_page==0):
         st.session_state.limits_page -= 1
@@ -1038,16 +1297,16 @@ elif page == "Risk & FEFO":
     
     **Critical Threshold:** Products with **≤90 days (3 months)** to expiry are considered high risk and require immediate attention.
     """)
-
+    
     PAGE_SIZE = 100
     if "risk_page" not in st.session_state:
         st.session_state.risk_page = 0
     offset = st.session_state.risk_page * PAGE_SIZE
-
+    
     total = get_cached_count("product_risk_scores", filter_col="branch_id" if branch_id else None,
                              filter_val=branch_id if branch_id else None)
     total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
-
+    
     sort_display = st.selectbox("Sort by", [
         "Highest risk first",
         "Earliest expiry first",
@@ -1062,21 +1321,21 @@ elif page == "Risk & FEFO":
     else:
         order_col = "financial_value"
         order_desc = True
-
+    
     query = supabase.table("view_risk_list").select("id,branch_id,branch_name,product_id,product_name,sku,batch,quantity,financial_value,expiry_date,days_to_expiry,risk_score,risk_level")
     if branch_id:
         query = query.eq("branch_id", branch_id)
-
+    
     query = query.order(order_col, desc=order_desc)
     risk_scores = query.range(offset, offset+PAGE_SIZE-1).execute().data
-
+    
     if not risk_scores:
         st.info("No risk scores available. Run the daily maintenance function first.")
         st.stop()
-
+    
     df_risk = pd.DataFrame(risk_scores)
     df_risk['expiry_date'] = pd.to_datetime(df_risk['expiry_date']).dt.date
-
+    
     def get_risk_color(row):
         if row['days_to_expiry'] is None or pd.isna(row['days_to_expiry']):
             return "🟢"
@@ -1088,18 +1347,18 @@ elif page == "Risk & FEFO":
             return "🟡"
         else:
             return "🟢"
-
+    
     df_risk['risk_indicator'] = df_risk.apply(get_risk_color, axis=1)
-
+    
     st.subheader("📋 Batch Risk Assessment")
-    st.dataframe(df_risk[['risk_indicator', 'product_name','sku','batch','quantity','financial_value','expiry_date','days_to_expiry','risk_level']].rename(columns={
+    mobile_friendly_table(df_risk[['risk_indicator', 'product_name','sku','batch','quantity','financial_value','expiry_date','days_to_expiry','risk_level']].rename(columns={
         'risk_indicator': 'Risk',
         'product_name':'Product',
         'sku':'SKU',
         'financial_value':'Financial Exposure (₦)',
         'days_to_expiry':'Days Left'
     }))
-
+    
     col1, col2 = st.columns(2)
     if col1.button("Prev Risk", disabled=st.session_state.risk_page==0):
         st.session_state.risk_page -= 1
@@ -1108,7 +1367,7 @@ elif page == "Risk & FEFO":
         st.session_state.risk_page += 1
         st.rerun()
     st.caption(f"Page {st.session_state.risk_page+1} of {total_pages}")
-
+    
     st.subheader("📌 FEFO Recommendation (Consumption Order)")
     fefo_order = df_risk.sort_values('expiry_date').head(20)
     for idx, row in fefo_order.iterrows():
@@ -1123,16 +1382,16 @@ elif page == "Risk & FEFO":
             else:
                 urgency = "🟢 LOW - Normal rotation"
             st.write(f"- **{row['product_name']}** (Batch `{row['batch']}`) – Expires **{row['expiry_date']}** ({days_left} days) – {urgency}")
-
+    
     st.subheader("📊 Risk Distribution")
     risk_counts = df_risk['risk_level'].value_counts()
     st.bar_chart(risk_counts)
-
+    
     critical_items = df_risk[df_risk['days_to_expiry'] <= 90]
     if not critical_items.empty:
         st.warning(f"⚠️ **{len(critical_items)}** batches have ≤90 days to expiry and require immediate attention!")
-        st.dataframe(critical_items[['product_name', 'sku', 'batch', 'quantity', 'days_to_expiry']].head(10))
-
+        mobile_friendly_table(critical_items[['product_name', 'sku', 'batch', 'quantity', 'days_to_expiry']].head(10))
+    
     with st.expander("ℹ️ How risk score is calculated"):
         st.markdown("""
         **Risk Score = (Expiry Score × 0.5) + (Financial Score × 0.3) + (Low Velocity Score × 0.2)**  
@@ -1176,6 +1435,7 @@ elif page == "Transfer Suggestions":
         res = query.execute()
         suggestions = res.data
     except Exception as e:
+        logger.error("Failed to fetch transfer suggestions", {"error": str(e)})
         st.error("⚠️ Unable to fetch transfer suggestions. Please contact your administrator.")
         st.stop()
     
@@ -1224,3 +1484,145 @@ elif page == "Transfer Suggestions":
           - MEDIUM (expiry 121-180 days)
         - All calculations run inside PostgreSQL using indexed joins – no client‑side processing.
         """)
+
+# ============================================================
+# PAGE: SYSTEM LOGS (admin only)
+# ============================================================
+elif page == "System Logs":
+    if st.session_state.user_role != "admin":
+        st.error("Permission denied.")
+        logger.warning("Unauthorized access attempt to System Logs page")
+        st.stop()
+    
+    st.header("📋 System Logs")
+    st.markdown("View structured system logs for debugging and monitoring.")
+    
+    # Log filters
+    col1, col2 = st.columns(2)
+    with col1:
+        log_level = st.selectbox("Filter by level", ["ALL", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
+    with col2:
+        max_logs = st.number_input("Max logs to display", min_value=10, max_value=1000, value=100)
+    
+    # Get logs
+    logs = logger.get_logs()
+    if log_level != "ALL":
+        logs = [log for log in logs if log['level'] == log_level]
+    
+    logs = logs[-max_logs:]
+    
+    if logs:
+        # Display logs in a table
+        df_logs = pd.DataFrame(logs)
+        df_logs['timestamp'] = pd.to_datetime(df_logs['timestamp'])
+        mobile_friendly_table(df_logs[['timestamp', 'level', 'message', 'extra']])
+        
+        # Export logs
+        st.subheader("📤 Export Logs")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("📥 Export as JSON"):
+                json_data = logger.export_logs()
+                st.download_button(
+                    label="Download JSON",
+                    data=json_data,
+                    file_name=f"system_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                    mime="application/json"
+                )
+        with col2:
+            if st.button("🗑️ Clear Logs"):
+                logger.logs.clear()
+                logger.info("Logs cleared by user")
+                st.success("Logs cleared!")
+                st.rerun()
+    else:
+        st.info("No logs available.")
+
+# ============================================================
+# PAGE: DATA EXPORT
+# ============================================================
+elif page == "Data Export":
+    st.header("📤 Data Export")
+    st.markdown("Export inventory data in various formats for reporting and analysis.")
+    
+    export_type = st.selectbox("Select data to export", [
+        "Current Inventory",
+        "Products Master",
+        "Stock Limits",
+        "Risk Scores",
+        "Alert Log",
+        "Transfer Suggestions"
+    ])
+    
+    format_type = st.selectbox("Export format", ["CSV", "Excel"])
+    
+    if st.button("Generate Export"):
+        with st.spinner(f"Generating {export_type} export..."):
+            try:
+                data = []
+                
+                if export_type == "Current Inventory":
+                    query = supabase.table("view_inventory_list").select("*")
+                    if branch_id:
+                        query = query.eq("branch_id", branch_id)
+                    data = query.execute().data
+                    filename = f"inventory_{selected_branch_name}_{datetime.now().strftime('%Y%m%d')}"
+                
+                elif export_type == "Products Master":
+                    data = supabase.table("products").select("*").execute().data
+                    filename = f"products_{datetime.now().strftime('%Y%m%d')}"
+                
+                elif export_type == "Stock Limits":
+                    query = supabase.table("stock_limits").select("*, products(name), branches(name)")
+                    if branch_id:
+                        query = query.eq("branch_id", branch_id)
+                    data = query.execute().data
+                    filename = f"stock_limits_{datetime.now().strftime('%Y%m%d')}"
+                
+                elif export_type == "Risk Scores":
+                    query = supabase.table("view_risk_list").select("*")
+                    if branch_id:
+                        query = query.eq("branch_id", branch_id)
+                    data = query.execute().data
+                    filename = f"risk_scores_{datetime.now().strftime('%Y%m%d')}"
+                
+                elif export_type == "Alert Log":
+                    query = supabase.table("alert_log").select("*, products(name), branches(name)")
+                    if branch_id:
+                        query = query.eq("branch_id", branch_id)
+                    data = query.execute().data
+                    filename = f"alerts_{datetime.now().strftime('%Y%m%d')}"
+                
+                elif export_type == "Transfer Suggestions":
+                    query = supabase.table("view_all_transfer_suggestions").select("*")
+                    if branch_id:
+                        query = query.eq("from_branch_id", branch_id)
+                    data = query.execute().data
+                    filename = f"transfer_suggestions_{datetime.now().strftime('%Y%m%d')}"
+                
+                if data:
+                    if format_type == "CSV":
+                        export_data = export_data_to_csv(data, filename)
+                        st.download_button(
+                            label=f"📥 Download {filename}.csv",
+                            data=export_data,
+                            file_name=f"{filename}.csv",
+                            mime="text/csv"
+                        )
+                    else:  # Excel
+                        export_data = export_data_to_excel(data, filename)
+                        st.download_button(
+                            label=f"📥 Download {filename}.xlsx",
+                            data=export_data,
+                            file_name=f"{filename}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        )
+                    
+                    logger.info(f"Export generated", {"type": export_type, "format": format_type, "rows": len(data)})
+                    st.success(f"✅ {len(data)} rows exported successfully!")
+                else:
+                    st.warning("No data available for export.")
+                    
+            except Exception as e:
+                logger.error(f"Export failed", {"type": export_type, "error": str(e)})
+                st.error(f"Export failed: {str(e)}")
