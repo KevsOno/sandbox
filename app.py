@@ -667,16 +667,6 @@ if st.session_state.authenticated:
         for branch in branches:
             st.sidebar.write(f"  • {branch['name']} ({branch['code']})")
     
-    # Show registered emails (quick view for admins)
-    if st.session_state.user_role == "admin":
-        with st.sidebar.expander("📧 Registered Users", expanded=False):
-            registered = get_registered_emails()
-            if registered:
-                df = pd.DataFrame(registered)
-                st.dataframe(df[['email', 'role', 'access']], use_container_width=True)
-            else:
-                st.info("No registered users")
-    
     # Logout button
     if st.sidebar.button("🚪 Logout", use_container_width=True):
         logger.info(f"User logged out", {"email": st.session_state.get('user_email')}, security=True)
@@ -1461,7 +1451,7 @@ elif page == "Products & Inventory":
                 st.info("No products found. Add your first product above!")
 
 # ============================================================
-# PAGE: BRANCHES (admin only) - UPDATED WITH EMAIL DISPLAY
+# PAGE: BRANCHES (admin only)
 # ============================================================
 elif page == "Branches":
     if st.session_state.user_role != "admin":
@@ -1475,7 +1465,7 @@ elif page == "Branches":
     - **Storekeeper, Procurement, Inventory, Auditor** → Viewer access (uses Viewer Password)
     - **Manager** → Admin access (uses Admin Password)
     
-    **Email Management:** When you click on a branch, all existing emails will be displayed in the appropriate text boxes for easy editing.
+    **Email Management:** When you expand a branch, all existing emails will be displayed in the appropriate text boxes for easy editing.
     """)
     
     # Get all branches with full details
@@ -2525,7 +2515,6 @@ elif page == "Security Settings":
         ✅ **Error Handling:** No sensitive information in error messages
         ✅ **Data Protection:** Secure data storage in Supabase
         ✅ **User Management:** View all registered users with roles
-        ✅ **Email Display:** All branch emails displayed for easy editing
         
         **Recommendations:**
         - Regularly review security logs
