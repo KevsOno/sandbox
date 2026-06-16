@@ -1461,7 +1461,7 @@ elif page == "Products & Inventory":
                 st.info("No products found. Add your first product above!")
 
 # ============================================================
-# PAGE: BRANCHES (admin only)
+# PAGE: BRANCHES (admin only) - UPDATED WITH EMAIL DISPLAY
 # ============================================================
 elif page == "Branches":
     if st.session_state.user_role != "admin":
@@ -1474,36 +1474,124 @@ elif page == "Branches":
     **Note:** Users can login using the email addresses listed in any branch.
     - **Storekeeper, Procurement, Inventory, Auditor** → Viewer access (uses Viewer Password)
     - **Manager** → Admin access (uses Admin Password)
+    
+    **Email Management:** When you click on a branch, all existing emails will be displayed in the appropriate text boxes for easy editing.
     """)
     
-    branches = get_branches()
+    # Get all branches with full details
+    @cached_with_invalidation(ttl=60, key_prefix="branches_full")
+    def get_branches_full():
+        """Get branches with all fields including emails"""
+        try:
+            data = supabase.table("branches").select(
+                "id,name,code,storekeeper_email,procurement_email,inventory_email,auditor_email,manager_email"
+            ).execute().data
+            return data
+        except Exception as e:
+            logger.error("Failed to fetch branches with emails", {"error": str(e)})
+            return []
+    
+    branches = get_branches_full()
     
     if not branches:
         st.info("No branches found. Use 'Add Branch' below.")
     else:
         for branch in branches:
-            with st.expander(f"✏️ {branch['name']} ({branch['code']})"):
+            # Create a unique key for each branch form
+            branch_key = f"branch_{branch['id']}"
+            
+            # Show current emails in a summary
+            with st.expander(f"📋 {branch['name']} ({branch['code']})", expanded=False):
+                # Show email summary
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown("**Current Emails:**")
+                    if branch.get('storekeeper_email'):
+                        st.write(f"📧 Storekeeper: {branch['storekeeper_email']}")
+                    if branch.get('procurement_email'):
+                        st.write(f"📧 Procurement: {branch['procurement_email']}")
+                    if branch.get('inventory_email'):
+                        st.write(f"📧 Inventory: {branch['inventory_email']}")
+                with col2:
+                    if branch.get('auditor_email'):
+                        st.write(f"📧 Auditor: {branch['auditor_email']}")
+                    if branch.get('manager_email'):
+                        st.write(f"📧 Manager: {branch['manager_email']}")
+                    if not any([
+                        branch.get('storekeeper_email'),
+                        branch.get('procurement_email'),
+                        branch.get('inventory_email'),
+                        branch.get('auditor_email'),
+                        branch.get('manager_email')
+                    ]):
+                        st.write("⚠️ No emails assigned")
+                
+                st.markdown("---")
+                st.subheader("✏️ Edit Branch Details")
+                
                 with st.form(key=f"edit_branch_{branch['id']}"):
                     col1, col2 = st.columns(2)
                     with col1:
                         new_name = st.text_input("Branch Name", value=branch['name'])
                         new_code = st.text_input("Branch Code", value=branch['code'])
+                        
+                        st.markdown("**📧 Viewer Role Emails:**")
+                        new_storekeeper = st.text_input(
+                            "Storekeeper Email", 
+                            value=branch.get('storekeeper_email', ''),
+                            help="This user will have Viewer access"
+                        )
+                        new_procurement = st.text_input(
+                            "Procurement Email", 
+                            value=branch.get('procurement_email', ''),
+                            help="This user will have Viewer access"
+                        )
+                        new_inventory = st.text_input(
+                            "Inventory Email", 
+                            value=branch.get('inventory_email', ''),
+                            help="This user will have Viewer access"
+                        )
                     with col2:
-                        new_storekeeper = st.text_input("Storekeeper Email", value=branch.get('storekeeper_email', ''))
-                        new_procurement = st.text_input("Procurement Email", value=branch.get('procurement_email', ''))
-                        new_inventory = st.text_input("Inventory Email", value=branch.get('inventory_email', ''))
-                        new_auditor = st.text_input("Auditor Email", value=branch.get('auditor_email', ''))
-                        new_manager = st.text_input("Manager Email", value=branch.get('manager_email', ''))
+                        st.markdown("**📧 Viewer Role Emails (continued):**")
+                        new_auditor = st.text_input(
+                            "Auditor Email", 
+                            value=branch.get('auditor_email', ''),
+                            help="This user will have Viewer access"
+                        )
+                        
+                        st.markdown("**📧 Admin Role Email:**")
+                        new_manager = st.text_input(
+                            "Manager Email", 
+                            value=branch.get('manager_email', ''),
+                            help="This user will have Admin access"
+                        )
                     
-                    st.caption("💡 Users with these emails can login using the system password.")
+                    # Show role summary
+                    st.info("""
+                    **Role Mapping:**
+                    - Storekeeper, Procurement, Inventory, Auditor → **Viewer** (uses Viewer Password)
+                    - Manager → **Admin** (uses Admin Password)
+                    """)
                     
-                    submitted = st.form_submit_button("💾 Save Changes")
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        submitted = st.form_submit_button("💾 Save Changes", use_container_width=True)
+                    with col2:
+                        if st.form_submit_button("🔄 Reset to Current", use_container_width=True):
+                            # Force refresh the branch data
+                            CacheManager.invalidate_all()
+                            st.rerun()
+                    
                     if submitted:
                         update_data = {}
+                        
+                        # Check each field for changes
                         if new_name != branch['name']:
                             update_data['name'] = new_name
                         if new_code != branch['code']:
                             update_data['code'] = new_code
+                        
+                        # Email fields - update if changed or set to empty
                         if new_storekeeper != branch.get('storekeeper_email', ''):
                             update_data['storekeeper_email'] = new_storekeeper or None
                         if new_procurement != branch.get('procurement_email', ''):
@@ -1518,8 +1606,15 @@ elif page == "Branches":
                         if update_data:
                             try:
                                 supabase.table("branches").update(update_data).eq("id", branch['id']).execute()
-                                st.success(f"✅ Branch '{new_name}' updated.")
-                                logger.info(f"Branch updated", {"id": branch['id'], "name": new_name})
+                                st.success(f"✅ Branch '{new_name}' updated successfully!")
+                                
+                                # Log the changes
+                                logger.info(f"Branch updated", {
+                                    "id": branch['id'], 
+                                    "name": new_name,
+                                    "updated_fields": list(update_data.keys())
+                                })
+                                
                                 CacheManager.invalidate_all()
                                 st.rerun()
                             except Exception as e:
@@ -1535,12 +1630,16 @@ elif page == "Branches":
         with col1:
             name = st.text_input("Branch Name*")
             code = st.text_input("Branch Code*")
+            
+            st.markdown("**📧 Viewer Role Emails:**")
+            storekeeper_email = st.text_input("Storekeeper Email", help="Viewer access")
+            procurement_email = st.text_input("Procurement Email", help="Viewer access")
+            inventory_email = st.text_input("Inventory Email", help="Viewer access")
         with col2:
-            storekeeper_email = st.text_input("Storekeeper Email")
-            procurement_email = st.text_input("Procurement Email")
-            inventory_email = st.text_input("Inventory Email")
-            auditor_email = st.text_input("Auditor Email")
-            manager_email = st.text_input("Manager Email")
+            auditor_email = st.text_input("Auditor Email", help="Viewer access")
+            
+            st.markdown("**📧 Admin Role Email:**")
+            manager_email = st.text_input("Manager Email", help="Admin access")
         
         st.caption("💡 Users with these emails will be able to login with the system password.")
         
@@ -1630,7 +1729,6 @@ elif page == "Registered Users":
             viewer_count = len([u for u in registered_users if u['access'] == 'Viewer'])
             st.metric("Viewers", viewer_count)
         with col4:
-            # Count users with no branch assigned
             no_branch = len([u for u in registered_users if not u['branches']])
             st.metric("No Branch Assigned", no_branch)
         
@@ -1639,7 +1737,6 @@ elif page == "Registered Users":
         # Detailed table view
         st.subheader("📋 Detailed User List")
         
-        # Prepare data for display
         display_data = []
         for user in registered_users:
             branch_info = []
@@ -2428,6 +2525,7 @@ elif page == "Security Settings":
         ✅ **Error Handling:** No sensitive information in error messages
         ✅ **Data Protection:** Secure data storage in Supabase
         ✅ **User Management:** View all registered users with roles
+        ✅ **Email Display:** All branch emails displayed for easy editing
         
         **Recommendations:**
         - Regularly review security logs
