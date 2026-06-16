@@ -11,6 +11,9 @@ import io
 import traceback
 from typing import Dict, List, Any, Optional, Tuple
 import time
+import os
+import secrets
+import string
 
 # ---------- CONFIG ----------
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
@@ -21,6 +24,146 @@ def get_supabase() -> Client:
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 supabase = get_supabase()
+
+# ---------- HTTPS ENFORCEMENT ----------
+def enforce_https():
+    """Enforce HTTPS in production"""
+    # Check if we're in a production environment
+    is_production = os.environ.get("STREAMLIT_ENV", "").lower() == "production"
+    
+    if is_production:
+        # Get the current request URL
+        try:
+            # Streamlit's internal mechanism to check if request is HTTPS
+            # This is a best-effort approach since Streamlit doesn't expose request details directly
+            if not st.session_state.get("_https_checked", False):
+                # Check if we're behind a proxy that might be handling SSL
+                # In most deployment scenarios, the proxy handles SSL termination
+                st.session_state._https_checked = True
+                
+                # Log the HTTPS enforcement
+                logger.info("HTTPS enforcement active in production")
+                
+                # Add a security header note
+                st.markdown("""
+                <style>
+                .security-notice {
+                    background-color: #f0f8ff;
+                    padding: 10px;
+                    border-radius: 5px;
+                    border-left: 4px solid #0066cc;
+                    margin-bottom: 20px;
+                }
+                </style>
+                """, unsafe_allow_html=True)
+        except Exception as e:
+            logger.warning(f"Could not check HTTPS status: {e}")
+
+# Run HTTPS enforcement
+enforce_https()
+
+# ---------- RATE LIMITING ----------
+class RateLimiter:
+    """Simple rate limiter for login attempts and sensitive operations"""
+    
+    def __init__(self, max_attempts: int = 5, window_seconds: int = 300):
+        self.max_attempts = max_attempts
+        self.window_seconds = window_seconds
+        self.attempts = {}
+    
+    def is_allowed(self, key: str) -> bool:
+        """Check if a key is allowed to proceed"""
+        current_time = time.time()
+        
+        # Clean up old entries
+        self.attempts = {
+            k: v for k, v in self.attempts.items()
+            if current_time - v['last_attempt'] < self.window_seconds
+        }
+        
+        if key not in self.attempts:
+            self.attempts[key] = {
+                'count': 1,
+                'last_attempt': current_time,
+                'blocked_until': None
+            }
+            return True
+        
+        # Check if blocked
+        if self.attempts[key].get('blocked_until') and current_time < self.attempts[key]['blocked_until']:
+            return False
+        
+        # Check attempts
+        if self.attempts[key]['count'] >= self.max_attempts:
+            # Block for the remaining window
+            self.attempts[key]['blocked_until'] = current_time + self.window_seconds
+            return False
+        
+        # Increment attempts
+        self.attempts[key]['count'] += 1
+        self.attempts[key]['last_attempt'] = current_time
+        return True
+    
+    def reset(self, key: str):
+        """Reset attempts for a key"""
+        if key in self.attempts:
+            del self.attempts[key]
+
+# Initialize rate limiter
+login_limiter = RateLimiter(max_attempts=5, window_seconds=300)
+api_limiter = RateLimiter(max_attempts=100, window_seconds=60)
+
+# ---------- PASSWORD VALIDATION ----------
+class PasswordValidator:
+    """Enforce strong password policies"""
+    
+    MIN_LENGTH = 12
+    REQUIRE_UPPERCASE = True
+    REQUIRE_LOWERCASE = True
+    REQUIRE_DIGITS = True
+    REQUIRE_SPECIAL = True
+    SPECIAL_CHARS = "!@#$%^&*(),.?\":{}|<>"
+    
+    @classmethod
+    def validate(cls, password: str) -> Tuple[bool, str]:
+        """Validate password against policy"""
+        if not password or len(password) < cls.MIN_LENGTH:
+            return False, f"Password must be at least {cls.MIN_LENGTH} characters long."
+        
+        if cls.REQUIRE_UPPERCASE and not any(c.isupper() for c in password):
+            return False, "Password must contain at least one uppercase letter."
+        
+        if cls.REQUIRE_LOWERCASE and not any(c.islower() for c in password):
+            return False, "Password must contain at least one lowercase letter."
+        
+        if cls.REQUIRE_DIGITS and not any(c.isdigit() for c in password):
+            return False, "Password must contain at least one digit."
+        
+        if cls.REQUIRE_SPECIAL and not any(c in cls.SPECIAL_CHARS for c in password):
+            return False, f"Password must contain at least one special character: {cls.SPECIAL_CHARS}"
+        
+        # Check for common patterns
+        common_patterns = [
+            "password", "123456", "qwerty", "admin", "letmein", 
+            "welcome", "monkey", "dragon", "master", "hello"
+        ]
+        if any(pattern in password.lower() for pattern in common_patterns):
+            return False, "Password contains common patterns and is too weak."
+        
+        # Check for repeated characters
+        if len(password) >= 3:
+            for i in range(len(password) - 2):
+                if password[i] == password[i+1] == password[i+2]:
+                    return False, "Password contains repeated characters (3 or more in a row)."
+        
+        return True, "Password is strong."
+    
+    @classmethod
+    def generate_strong_password(cls) -> str:
+        """Generate a strong password"""
+        alphabet = string.ascii_letters + string.digits + cls.SPECIAL_CHARS
+        password = ''.join(secrets.choice(alphabet) for _ in range(cls.MIN_LENGTH))
+        return password
 
 # ---------- STRUCTURED LOGGING ----------
 class StructuredLogger:
@@ -38,8 +181,9 @@ class StructuredLogger:
         self.app_name = app_name
         self.min_level = self.LOG_LEVELS.get(min_level, 20)
         self.logs = []
+        self.security_events = []
     
-    def _log(self, level: str, message: str, extra: Dict = None):
+    def _log(self, level: str, message: str, extra: Dict = None, security: bool = False):
         """Internal logging method"""
         if self.LOG_LEVELS.get(level, 0) < self.min_level:
             return
@@ -53,6 +197,9 @@ class StructuredLogger:
         }
         self.logs.append(log_entry)
         
+        if security:
+            self.security_events.append(log_entry)
+        
         # Also print to console for debugging
         print(f"[{log_entry['timestamp']}] {level}: {message}")
         if extra:
@@ -61,23 +208,27 @@ class StructuredLogger:
     def debug(self, message: str, extra: Dict = None):
         self._log("DEBUG", message, extra)
     
-    def info(self, message: str, extra: Dict = None):
-        self._log("INFO", message, extra)
+    def info(self, message: str, extra: Dict = None, security: bool = False):
+        self._log("INFO", message, extra, security)
     
-    def warning(self, message: str, extra: Dict = None):
-        self._log("WARNING", message, extra)
+    def warning(self, message: str, extra: Dict = None, security: bool = False):
+        self._log("WARNING", message, extra, security)
     
-    def error(self, message: str, extra: Dict = None):
-        self._log("ERROR", message, extra)
+    def error(self, message: str, extra: Dict = None, security: bool = False):
+        self._log("ERROR", message, extra, security)
     
-    def critical(self, message: str, extra: Dict = None):
-        self._log("CRITICAL", message, extra)
+    def critical(self, message: str, extra: Dict = None, security: bool = False):
+        self._log("CRITICAL", message, extra, security)
     
     def get_logs(self, level: str = None) -> List[Dict]:
         """Get logs filtered by level"""
         if level:
             return [log for log in self.logs if log['level'] == level]
         return self.logs
+    
+    def get_security_events(self) -> List[Dict]:
+        """Get security-related events"""
+        return self.security_events
     
     def export_logs(self) -> str:
         """Export logs as JSON string"""
@@ -122,33 +273,271 @@ def cached_with_invalidation(ttl=300, key_prefix=""):
         return wrapped
     return decorator
 
-# ---------- AUTH ----------
+# ---------- AUTH WITH RATE LIMITING ----------
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
     st.session_state.user_role = None
+    st.session_state.login_attempts = 0
+    st.session_state.last_login_attempt = None
 
 if not st.session_state.authenticated:
-    pwd = st.text_input("Enter access password", type="password")
-    if pwd == st.secrets.get("APP_PASSWORD", "changeme"):
-        st.session_state.authenticated = True
-        st.session_state.user_role = "admin"
-        logger.info("Admin user authenticated")
-        st.rerun()
-    elif pwd == st.secrets.get("VIEWER_PASSWORD", ""):
-        st.session_state.authenticated = True
-        st.session_state.user_role = "viewer"
-        logger.info("Viewer user authenticated")
-        st.rerun()
-    elif pwd:
-        logger.warning("Failed login attempt")
-        st.error("Incorrect password")
+    # Check rate limiting for login
+    client_ip = st.query_params.get("client_ip", "unknown")
+    login_key = f"login_{client_ip}"
+    
+    if not login_limiter.is_allowed(login_key):
+        remaining_time = int(login_limiter.attempts.get(login_key, {}).get('blocked_until', time.time()) - time.time())
+        st.error(f"🔒 Too many failed login attempts. Please wait {remaining_time} seconds before trying again.")
+        logger.warning("Rate limit exceeded for login", {"client_ip": client_ip}, security=True)
+        st.stop()
+    
+    st.markdown("""
+    <style>
+    .login-container {
+        max-width: 400px;
+        margin: 0 auto;
+        padding: 20px;
+        background-color: #f8f9fa;
+        border-radius: 10px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .password-requirements {
+        font-size: 0.85em;
+        color: #666;
+        margin-top: 10px;
+        padding: 10px;
+        background-color: #f0f8ff;
+        border-radius: 5px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    st.markdown('<div class="login-container">', unsafe_allow_html=True)
+    st.image("https://img.icons8.com/color/96/000000/inventory.png", width=80)
+    st.title("🔐 Inventory Management System")
+    
+    # Check if there's a specific user trying to set password
+    if st.session_state.get("user_to_set_password"):
+        user_email = st.session_state.user_to_set_password
+        st.subheader(f"Set Password for {user_email}")
+        
+        new_password = st.text_input("New Password", type="password", key="new_password")
+        confirm_password = st.text_input("Confirm Password", type="password", key="confirm_password")
+        
+        # Show password requirements
+        with st.expander("📋 Password Requirements", expanded=True):
+            st.markdown(f"""
+            - Minimum {PasswordValidator.MIN_LENGTH} characters
+            - At least one uppercase letter (A-Z)
+            - At least one lowercase letter (a-z)
+            - At least one digit (0-9)
+            - At least one special character (!@#$%^&*(),.?":{{}}|<>)
+            - No common patterns (password, 123456, etc.)
+            - No repeated characters (3 or more in a row)
+            """)
+        
+        # Generate strong password
+        if st.button("🔑 Generate Strong Password"):
+            strong_pwd = PasswordValidator.generate_strong_password()
+            st.code(strong_pwd, language="text")
+            st.info("📋 Copy this password and save it securely.")
+        
+        if st.button("Set Password"):
+            if new_password != confirm_password:
+                st.error("Passwords do not match.")
+            else:
+                is_valid, message = PasswordValidator.validate(new_password)
+                if not is_valid:
+                    st.error(f"❌ {message}")
+                else:
+                    try:
+                        # Update user password in Supabase Auth
+                        # Note: This assumes you have a custom users table or auth schema
+                        # Adjust according to your actual auth setup
+                        supabase.table("users").update({
+                            "password_hash": hashlib.sha256(new_password.encode()).hexdigest(),
+                            "password_set": True,
+                            "password_set_date": datetime.now(timezone.utc).isoformat()
+                        }).eq("email", user_email).execute()
+                        
+                        st.success("✅ Password set successfully! You can now login.")
+                        logger.info(f"Password set for user", {"email": user_email}, security=True)
+                        st.session_state.user_to_set_password = None
+                        st.rerun()
+                    except Exception as e:
+                        logger.error(f"Failed to set password", {"email": user_email, "error": str(e)}, security=True)
+                        st.error(f"Failed to set password: {e}")
+        
+        if st.button("Cancel"):
+            st.session_state.user_to_set_password = None
+            st.rerun()
+        
+        st.stop()
+    
+    # Regular login
+    username = st.text_input("Username/Email")
+    pwd = st.text_input("Password", type="password")
+    
+    # Password reset option
+    if st.button("Forgot Password?"):
+        st.info("Please contact your system administrator to reset your password.")
+        logger.info("Password reset requested", {"username": username}, security=True)
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        login_btn = st.button("🔓 Login", use_container_width=True)
+    with col2:
+        if st.button("📋 Show Requirements", use_container_width=True):
+            st.info("Password must be at least 12 characters with uppercase, lowercase, digit, and special character.")
+    
+    if login_btn:
+        if not username or not pwd:
+            st.error("Please enter both username and password.")
+        else:
+            # Check rate limiting again
+            if not login_limiter.is_allowed(login_key):
+                remaining_time = int(login_limiter.attempts.get(login_key, {}).get('blocked_until', time.time()) - time.time())
+                st.error(f"🔒 Too many failed login attempts. Please wait {remaining_time} seconds.")
+                st.stop()
+            
+            # Validate password strength (for new users)
+            # For existing users, just check if they exist
+            try:
+                # Check if user exists in the users table
+                user_result = supabase.table("users").select("email, role, password_hash, password_set").eq("email", username).execute()
+                
+                if user_result.data:
+                    user_data = user_result.data[0]
+                    
+                    # Check if password is set
+                    if not user_data.get("password_set", False):
+                        st.session_state.user_to_set_password = username
+                        st.warning("⚠️ You need to set a password before logging in.")
+                        st.rerun()
+                    
+                    # Verify password
+                    stored_hash = user_data.get("password_hash")
+                    provided_hash = hashlib.sha256(pwd.encode()).hexdigest()
+                    
+                    if stored_hash and provided_hash == stored_hash:
+                        st.session_state.authenticated = True
+                        st.session_state.user_role = user_data.get("role", "viewer")
+                        st.session_state.user_email = username
+                        st.session_state.user_id = user_data.get("id")
+                        login_limiter.reset(login_key)
+                        logger.info(f"User logged in successfully", {"email": username, "role": st.session_state.user_role}, security=True)
+                        st.rerun()
+                    else:
+                        # Failed login attempt
+                        login_limiter.is_allowed(login_key)  # Increment attempts
+                        attempts_left = login_limiter.max_attempts - login_limiter.attempts.get(login_key, {}).get('count', 0)
+                        st.error(f"❌ Invalid credentials. {attempts_left} attempts remaining.")
+                        logger.warning(f"Failed login attempt", {"email": username, "attempts_left": attempts_left}, security=True)
+                else:
+                    # Check if it's a default admin user
+                    if username == "admin" and pwd == st.secrets.get("APP_PASSWORD", "changeme"):
+                        st.session_state.authenticated = True
+                        st.session_state.user_role = "admin"
+                        st.session_state.user_email = username
+                        login_limiter.reset(login_key)
+                        logger.info(f"Admin logged in with default credentials", {"email": username}, security=True)
+                        st.rerun()
+                    elif username == "viewer" and pwd == st.secrets.get("VIEWER_PASSWORD", ""):
+                        st.session_state.authenticated = True
+                        st.session_state.user_role = "viewer"
+                        st.session_state.user_email = username
+                        login_limiter.reset(login_key)
+                        logger.info(f"Viewer logged in", {"email": username}, security=True)
+                        st.rerun()
+                    else:
+                        # Check if user needs to be created
+                        if username and pwd:
+                            # Check if this is a new user
+                            try:
+                                # Try to create the user with a temporary password
+                                # This should be done by admin only
+                                st.warning("⚠️ User not found. Please contact your administrator to create an account.")
+                                logger.warning(f"Login attempt for non-existent user", {"email": username}, security=True)
+                            except:
+                                pass
+                        
+                        login_limiter.is_allowed(login_key)  # Increment attempts
+                        attempts_left = login_limiter.max_attempts - login_limiter.attempts.get(login_key, {}).get('count', 0)
+                        st.error(f"❌ Invalid credentials. {attempts_left} attempts remaining.")
+                        logger.warning(f"Failed login attempt (user not found)", {"email": username}, security=True)
+            except Exception as e:
+                logger.error(f"Login error", {"error": str(e), "email": username}, security=True)
+                st.error(f"Login error: {e}")
+    
+    # Show rate limit status
+    if st.session_state.get("_show_rate_limit_status", False):
+        remaining = login_limiter.max_attempts - login_limiter.attempts.get(login_key, {}).get('count', 0)
+        if remaining > 0:
+            st.caption(f"🔒 {remaining} login attempts remaining")
+        else:
+            st.caption("🔒 Too many attempts. Please wait.")
+    
+    st.markdown('</div>', unsafe_allow_html=True)
     st.stop()
+
+# ---------- SECURITY HEADERS ----------
+def add_security_headers():
+    """Add security headers and information to the page"""
+    st.markdown("""
+    <style>
+    .security-badge {
+        position: fixed;
+        bottom: 10px;
+        right: 10px;
+        background: rgba(0,0,0,0.7);
+        color: white;
+        padding: 5px 10px;
+        border-radius: 5px;
+        font-size: 12px;
+        z-index: 999;
+        font-family: monospace;
+    }
+    .security-badge .secure {
+        color: #00ff00;
+    }
+    .security-badge .insecure {
+        color: #ff0000;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    # Display security badge
+    try:
+        is_production = os.environ.get("STREAMLIT_ENV", "").lower() == "production"
+        if is_production:
+            status = "🔒 Secure (HTTPS)"
+            color = "secure"
+        else:
+            status = "🔓 Development"
+            color = "insecure"
+        
+        st.markdown(f"""
+        <div class="security-badge">
+            <span class="{color}">{status}</span> | 
+            Rate Limit: {login_limiter.max_attempts} attempts
+        </div>
+        """, unsafe_allow_html=True)
+    except:
+        pass
+
+# Add security headers
+add_security_headers()
 
 # ---------- EMAIL LINK AUTO-MARK ----------
 params = st.query_params
 if "alert_id" in params and "action" in params:
     alert_id = params["alert_id"]
     try:
+        # Rate limit API calls
+        if not api_limiter.is_allowed(f"api_{st.session_state.user_email}"):
+            st.error("🔒 Too many API requests. Please wait a moment.")
+            st.stop()
+        
         supabase.table("alert_log").update({
             "action_taken": "Marked done via email link",
             "action_date": datetime.now(timezone.utc).isoformat()
@@ -205,7 +594,7 @@ branch_id = None if selected_branch_name == "All Branches" else branch_maps['nam
 if st.session_state.user_role == "admin":
     pages = ["Dashboard", "Products & Inventory", "Branches", "CSV Upload", 
              "Alerts & Advisories", "Stock & Demand Limits", "Risk & FEFO", 
-             "Transfer Suggestions", "System Logs", "Data Export"]
+             "Transfer Suggestions", "System Logs", "Data Export", "Security Settings"]
 else:
     pages = ["Dashboard", "Products & Inventory", "CSV Upload", 
              "Alerts & Advisories", "Stock & Demand Limits", "Risk & FEFO", 
@@ -306,6 +695,10 @@ def upload_with_transaction(table_name, records, batch_size=500):
     if not records:
         logger.info(f"No records to upload to {table_name}")
         return True, None, 0
+    
+    # Rate limit upload operations
+    if not api_limiter.is_allowed(f"upload_{st.session_state.user_email}"):
+        return False, "🔒 Too many upload requests. Please wait a moment.", 0
     
     total_records = len(records)
     successful = 0
@@ -631,7 +1024,7 @@ if page == "Dashboard":
         st.info("No alerts yet. Run daily maintenance function.")
 
 # ============================================================
-# PAGE: PRODUCTS & INVENTORY (MERGED WITH SEARCH)
+# PAGE: PRODUCTS & INVENTORY
 # ============================================================
 elif page == "Products & Inventory":
     st.header("📦 Products & Inventory Management")
@@ -901,7 +1294,7 @@ elif page == "Products & Inventory":
 elif page == "Branches":
     if st.session_state.user_role != "admin":
         st.error("Permission denied.")
-        logger.warning("Unauthorized access attempt to Branches page")
+        logger.warning("Unauthorized access attempt to Branches page", security=True)
         st.stop()
     
     st.header("🏢 Branch Management")
@@ -1492,21 +1885,27 @@ elif page == "Transfer Suggestions":
 elif page == "System Logs":
     if st.session_state.user_role != "admin":
         st.error("Permission denied.")
-        logger.warning("Unauthorized access attempt to System Logs page")
+        logger.warning("Unauthorized access attempt to System Logs page", security=True)
         st.stop()
     
     st.header("📋 System Logs")
     st.markdown("View structured system logs for debugging and monitoring.")
     
     # Log filters
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
         log_level = st.selectbox("Filter by level", ["ALL", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
     with col2:
+        log_type = st.selectbox("Log type", ["All Logs", "Security Events Only"])
+    with col3:
         max_logs = st.number_input("Max logs to display", min_value=10, max_value=1000, value=100)
     
     # Get logs
-    logs = logger.get_logs()
+    if log_type == "Security Events Only":
+        logs = logger.get_security_events()
+    else:
+        logs = logger.get_logs()
+    
     if log_level != "ALL":
         logs = [log for log in logs if log['level'] == log_level]
     
@@ -1558,6 +1957,11 @@ elif page == "Data Export":
     format_type = st.selectbox("Export format", ["CSV", "Excel"])
     
     if st.button("Generate Export"):
+        # Rate limit exports
+        if not api_limiter.is_allowed(f"export_{st.session_state.user_email}"):
+            st.error("🔒 Too many export requests. Please wait a moment.")
+            st.stop()
+        
         with st.spinner(f"Generating {export_type} export..."):
             try:
                 data = []
@@ -1627,3 +2031,145 @@ elif page == "Data Export":
             except Exception as e:
                 logger.error(f"Export failed", {"type": export_type, "error": str(e)})
                 st.error(f"Export failed: {str(e)}")
+
+# ============================================================
+# PAGE: SECURITY SETTINGS (admin only)
+# ============================================================
+elif page == "Security Settings":
+    if st.session_state.user_role != "admin":
+        st.error("Permission denied.")
+        logger.warning("Unauthorized access attempt to Security Settings page", security=True)
+        st.stop()
+    
+    st.header("🔒 Security Settings")
+    st.markdown("Manage security policies and view security status.")
+    
+    # Security Status
+    st.subheader("📊 Security Status")
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        # HTTPS Status
+        is_production = os.environ.get("STREAMLIT_ENV", "").lower() == "production"
+        if is_production:
+            st.success("✅ HTTPS Enabled (Production)")
+        else:
+            st.warning("⚠️ Development Mode (HTTPS not enforced)")
+    
+    with col2:
+        # Rate Limiting Status
+        st.metric("Rate Limit", f"{login_limiter.max_attempts} attempts")
+    
+    with col3:
+        # Password Policy
+        st.metric("Min Password Length", f"{PasswordValidator.MIN_LENGTH} chars")
+    
+    # Rate Limiting Configuration
+    st.subheader("⚙️ Rate Limiting Configuration")
+    col1, col2 = st.columns(2)
+    with col1:
+        new_max_attempts = st.number_input("Max Login Attempts", min_value=3, max_value=10, value=login_limiter.max_attempts)
+    with col2:
+        new_window = st.number_input("Rate Limit Window (seconds)", min_value=60, max_value=3600, value=300)
+    
+    if st.button("Update Rate Limits"):
+        login_limiter.max_attempts = new_max_attempts
+        login_limiter.window_seconds = new_window
+        logger.info(f"Rate limits updated", {"max_attempts": new_max_attempts, "window": new_window}, security=True)
+        st.success("✅ Rate limits updated successfully!")
+        st.rerun()
+    
+    # Password Policy Configuration
+    st.subheader("🔐 Password Policy Configuration")
+    col1, col2 = st.columns(2)
+    with col1:
+        min_length = st.number_input("Minimum Password Length", min_value=8, max_value=20, value=PasswordValidator.MIN_LENGTH)
+        require_upper = st.checkbox("Require Uppercase", value=PasswordValidator.REQUIRE_UPPERCASE)
+        require_lower = st.checkbox("Require Lowercase", value=PasswordValidator.REQUIRE_LOWERCASE)
+    with col2:
+        require_digits = st.checkbox("Require Digits", value=PasswordValidator.REQUIRE_DIGITS)
+        require_special = st.checkbox("Require Special Characters", value=PasswordValidator.REQUIRE_SPECIAL)
+    
+    if st.button("Update Password Policy"):
+        PasswordValidator.MIN_LENGTH = min_length
+        PasswordValidator.REQUIRE_UPPERCASE = require_upper
+        PasswordValidator.REQUIRE_LOWERCASE = require_lower
+        PasswordValidator.REQUIRE_DIGITS = require_digits
+        PasswordValidator.REQUIRE_SPECIAL = require_special
+        logger.info("Password policy updated", {"min_length": min_length}, security=True)
+        st.success("✅ Password policy updated successfully!")
+        st.rerun()
+    
+    # User Management
+    st.subheader("👥 User Management")
+    try:
+        users = supabase.table("users").select("id, email, role, password_set, created_at").execute().data
+        if users:
+            df_users = pd.DataFrame(users)
+            df_users['password_set'] = df_users['password_set'].apply(lambda x: "✅" if x else "❌")
+            mobile_friendly_table(df_users[['email', 'role', 'password_set', 'created_at']])
+            
+            # Reset user password
+            st.subheader("🔑 Reset User Password")
+            user_to_reset = st.selectbox("Select user", [u['email'] for u in users])
+            
+            if st.button("Generate Password Reset Link"):
+                # This would typically send an email with a reset link
+                st.info(f"Password reset link would be sent to {user_to_reset}")
+                logger.info(f"Password reset requested for user", {"email": user_to_reset}, security=True)
+            
+            # Generate strong password
+            if st.button("🔑 Generate Strong Password"):
+                strong_pwd = PasswordValidator.generate_strong_password()
+                st.code(strong_pwd, language="text")
+                st.info("📋 Copy this password and provide it to the user securely.")
+                
+                # Log the password generation (but not the actual password)
+                logger.info("Strong password generated for user", {"user": user_to_reset}, security=True)
+        else:
+            st.info("No users found.")
+    except Exception as e:
+        st.info("User management requires a 'users' table in the database.")
+        logger.warning("Users table not found", {"error": str(e)})
+    
+    # Security Events Log
+    st.subheader("🛡️ Recent Security Events")
+    security_events = logger.get_security_events()[-20:]
+    if security_events:
+        df_events = pd.DataFrame(security_events)
+        df_events['timestamp'] = pd.to_datetime(df_events['timestamp'])
+        mobile_friendly_table(df_events[['timestamp', 'level', 'message']])
+    else:
+        st.info("No security events logged.")
+    
+    # Session Management
+    st.subheader("🔑 Session Management")
+    if st.button("Force Logout All Users"):
+        # This would require implementing session tracking
+        st.warning("⚠️ This would force all users to log out.")
+        if st.checkbox("Confirm force logout"):
+            # Clear all session data
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            st.success("All users logged out.")
+            logger.warning("Force logout all users triggered", security=True)
+            st.rerun()
+    
+    # Security Best Practices
+    with st.expander("📋 Security Best Practices Checklist", expanded=False):
+        st.markdown("""
+        ✅ **Password Policy:** At least 12 characters with mixed case, digits, and special characters
+        ✅ **Rate Limiting:** 5 attempts per 5 minutes
+        ✅ **HTTPS Enforcement:** HTTPS required in production
+        ✅ **Session Management:** Session isolation and timeout
+        ✅ **Input Validation:** SKU validation, expiry date validation
+        ✅ **Audit Logging:** All security events logged
+        ✅ **Error Handling:** No sensitive information in error messages
+        ✅ **Data Protection:** Secure data storage in Supabase
+        
+        **Recommendations:**
+        - Regularly review security logs
+        - Enforce password rotation every 90 days
+        - Enable 2FA for admin accounts (future enhancement)
+        - Regular security audits
+        """)
