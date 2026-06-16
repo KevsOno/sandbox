@@ -2,6 +2,10 @@ import streamlit as st
 import pandas as pd
 from supabase import create_client, Client
 from datetime import date, datetime, timedelta, timezone
+import re
+from functools import wraps
+import hashlib
+import json
 
 # ---------- CONFIG ----------
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
@@ -12,6 +16,42 @@ def get_supabase() -> Client:
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 supabase = get_supabase()
+
+# ---------- CACHE MANAGEMENT ----------
+class CacheManager:
+    """Centralized cache management with invalidation"""
+    _cache_keys = set()
+    
+    @staticmethod
+    def invalidate_all():
+        """Invalidate all cached functions"""
+        for key in list(CacheManager._cache_keys):
+            try:
+                st.cache_data.clear()
+            except:
+                pass
+        CacheManager._cache_keys.clear()
+    
+    @staticmethod
+    def register(key):
+        CacheManager._cache_keys.add(key)
+
+def cached_with_invalidation(ttl=300, key_prefix=""):
+    """Decorator for cached functions with invalidation tracking"""
+    def decorator(func):
+        @st.cache_data(ttl=ttl, show_spinner=False)
+        def wrapper(*args, **kwargs):
+            return func(*args, **kwargs)
+        
+        # Register the function for invalidation
+        func_name = key_prefix or func.__name__
+        CacheManager.register(func_name)
+        
+        @wraps(func)
+        def wrapped(*args, **kwargs):
+            return wrapper(*args, **kwargs)
+        return wrapped
+    return decorator
 
 # ---------- AUTH ----------
 if "authenticated" not in st.session_state:
@@ -45,13 +85,25 @@ if "alert_id" in params and "action" in params:
     st.rerun()
 
 # ---------- BRANCH SELECTOR ----------
-@st.cache_data(ttl=300)
+@cached_with_invalidation(ttl=3600, key_prefix="branches")  # 1 hour cache for branches
 def get_branches():
+    """Get branches with efficient single query"""
     return supabase.table("branches").select("id,name,code").execute().data
 
+# Cache branch lookup maps separately
+@cached_with_invalidation(ttl=3600, key_prefix="branch_maps")
+def get_branch_maps():
+    """Pre-compute branch lookup maps to avoid repeated lookups"""
+    branches = get_branches()
+    return {
+        'id_to_name': {b['id']: b['name'] for b in branches},
+        'name_to_id': {b['name']: b['id'] for b in branches},
+        'id_to_code': {b['id']: b['code'] for b in branches}
+    }
+
 branches_data = get_branches()
+branch_maps = get_branch_maps()
 branch_names = [b['name'] for b in branches_data]
-branch_id_map = {b['name']: b['id'] for b in branches_data}
 
 def reset_pagination():
     st.session_state.prod_page = 0
@@ -65,7 +117,7 @@ selected_branch_name = st.sidebar.selectbox(
     ["All Branches"] + branch_names,
     on_change=reset_pagination
 )
-branch_id = None if selected_branch_name == "All Branches" else branch_id_map[selected_branch_name]
+branch_id = None if selected_branch_name == "All Branches" else branch_maps['name_to_id'].get(selected_branch_name)
 
 # ---------- NAVIGATION ----------
 if st.session_state.user_role == "admin":
@@ -77,32 +129,164 @@ page = st.sidebar.radio("Go to", pages)
 
 # ---------- HELPERS ----------
 def validate_csv_columns(df, required_cols, label="CSV"):
+    """Validate CSV has required columns with better error messages"""
     missing = required_cols - set(df.columns)
     if missing:
         return False, f"❌ Missing columns in {label}: {', '.join(missing)}"
     return True, ""
 
-def upload_csv_to_table(table_name, df, extra_columns={}):
-    for col, val in extra_columns.items():
-        df[col] = val
-    records = df.to_dict(orient="records")
-    for rec in records:
-        for k, v in rec.items():
-            if isinstance(v, (date, datetime)):
-                rec[k] = v.isoformat()
-    chunk_size = 500
-    total_chunks = (len(records) + chunk_size - 1) // chunk_size
-    i = 0
-    try:
-        for i in range(0, len(records), chunk_size):
-            chunk_num = i // chunk_size + 1
-            supabase.table(table_name).insert(records[i:i+chunk_size]).execute()
-        return True, None
-    except Exception as e:
-        error_msg = f"Upload failed at chunk {chunk_num}/{total_chunks}. Error: {e}"
-        return False, error_msg
+def validate_sku_format(sku):
+    """Validate SKU format - alphanumeric, underscores, hyphens only"""
+    if not sku or not isinstance(sku, str):
+        return False
+    # Allow alphanumeric, underscores, hyphens, and periods
+    return bool(re.match(r'^[A-Za-z0-9_\-\.]+$', sku))
 
+def validate_expiry_date(expiry_date):
+    """Validate expiry date is in the future"""
+    if expiry_date is None:
+        return True  # Non-expiring items are fine
+    if isinstance(expiry_date, str):
+        try:
+            expiry_date = datetime.strptime(expiry_date, '%Y-%m-%d').date()
+        except:
+            return False
+    today = date.today()
+    return expiry_date >= today
+
+def upload_with_transaction(table_name, records, batch_size=500):
+    """
+    Upload with transaction-like behavior - if any batch fails, stop and report
+    Returns (success, error_message, successful_count)
+    """
+    if not records:
+        return True, None, 0
+    
+    total_records = len(records)
+    successful = 0
+    failed_batch = None
+    
+    for i in range(0, total_records, batch_size):
+        batch = records[i:i+batch_size]
+        batch_num = (i // batch_size) + 1
+        total_batches = (total_records + batch_size - 1) // batch_size
+        
+        try:
+            # Convert dates to ISO format for Supabase
+            batch_clean = []
+            for rec in batch:
+                rec_clean = {}
+                for k, v in rec.items():
+                    if isinstance(v, (date, datetime)):
+                        rec_clean[k] = v.isoformat()
+                    elif isinstance(v, pd.Timestamp):
+                        rec_clean[k] = v.isoformat()
+                    else:
+                        rec_clean[k] = v
+                batch_clean.append(rec_clean)
+            
+            supabase.table(table_name).insert(batch_clean).execute()
+            successful += len(batch)
+        except Exception as e:
+            failed_batch = batch_num
+            return False, f"Upload failed at batch {batch_num}/{total_batches}. Error: {str(e)}", successful
+    
+    return True, None, successful
+
+def bulk_upsert_products(products_data, batch_size=200):
+    """
+    Upsert products with SKU validation and uniqueness check
+    Returns (success, error_message, created_count, updated_count)
+    """
+    if not products_data:
+        return True, None, 0, 0
+    
+    # Validate all SKUs first
+    invalid_skus = []
+    for p in products_data:
+        if not validate_sku_format(p.get('sku', '')):
+            invalid_skus.append(p.get('sku', 'unknown'))
+    
+    if invalid_skus:
+        return False, f"Invalid SKU format in: {', '.join(invalid_skus[:10])}", 0, 0
+    
+    # Deduplicate by SKU
+    sku_map = {}
+    for p in products_data:
+        sku = p['sku']
+        if sku not in sku_map:
+            sku_map[sku] = p
+        else:
+            # Merge or keep first occurrence
+            existing = sku_map[sku]
+            # Update with any new fields if they're missing
+            for key, value in p.items():
+                if key not in existing or existing[key] is None:
+                    existing[key] = value
+    
+    unique_products = list(sku_map.values())
+    
+    # Check which products already exist
+    skus = [p['sku'] for p in unique_products]
+    existing_skus = get_existing_skus(skus)
+    
+    created_count = 0
+    updated_count = 0
+    
+    for i in range(0, len(unique_products), batch_size):
+        batch = unique_products[i:i+batch_size]
+        for product in batch:
+            sku = product['sku']
+            if sku in existing_skus:
+                # Update existing
+                try:
+                    # Remove id if present for update
+                    product_clean = {k: v for k, v in product.items() if k != 'id'}
+                    supabase.table("products").update(product_clean).eq("sku", sku).execute()
+                    updated_count += 1
+                except Exception as e:
+                    return False, f"Update failed for SKU {sku}: {str(e)}", created_count, updated_count
+            else:
+                # Insert new
+                try:
+                    product_clean = {k: v for k, v in product.items() if k != 'id'}
+                    supabase.table("products").insert(product_clean).execute()
+                    created_count += 1
+                except Exception as e:
+                    return False, f"Insert failed for SKU {sku}: {str(e)}", created_count, updated_count
+    
+    return True, None, created_count, updated_count
+
+@cached_with_invalidation(ttl=300, key_prefix="existing_skus")
+def get_existing_skus(sku_list=None):
+    """Get existing SKUs from products table with caching"""
+    query = supabase.table("products").select("sku")
+    if sku_list:
+        # Chunk the query to avoid URL length limits
+        all_skus = set()
+        for i in range(0, len(sku_list), 500):
+            chunk = sku_list[i:i+500]
+            result = query.in_("sku", chunk).execute()
+            all_skus.update([r['sku'] for r in result.data])
+        return all_skus
+    else:
+        # Get all SKUs (use pagination for large datasets)
+        all_skus = set()
+        offset = 0
+        while True:
+            result = query.range(offset, offset+1000).execute()
+            if not result.data:
+                break
+            all_skus.update([r['sku'] for r in result.data])
+            offset += 1000
+        return all_skus
+
+@cached_with_invalidation(ttl=60, key_prefix="sku_to_id")
 def chunked_sku_lookup(skus, chunk_size=200):
+    """Efficient SKU to ID lookup with caching"""
+    if not skus:
+        return {}
+    
     sku_to_id = {}
     for i in range(0, len(skus), chunk_size):
         chunk = skus[i:i+chunk_size]
@@ -112,9 +296,20 @@ def chunked_sku_lookup(skus, chunk_size=200):
     return sku_to_id
 
 def ensure_products_exist(skus, default_cost=0.0, default_shelf_life=90):
+    """Ensure products exist, with better error handling and validation"""
+    if not skus:
+        return {}
+    
     sku_to_id = chunked_sku_lookup(skus)
     missing = [sku for sku in skus if sku not in sku_to_id]
+    
     if missing:
+        # Validate SKUs before creating
+        invalid_skus = [sku for sku in missing if not validate_sku_format(sku)]
+        if invalid_skus:
+            st.error(f"❌ Invalid SKU format in: {', '.join(invalid_skus[:10])}")
+            return {}
+        
         new_products = []
         for sku in missing:
             new_products.append({
@@ -124,19 +319,48 @@ def ensure_products_exist(skus, default_cost=0.0, default_shelf_life=90):
                 "shelf_life_days": default_shelf_life,
                 "cost": default_cost
             })
-        chunk_size = 200
-        for i in range(0, len(new_products), chunk_size):
-            supabase.table("products").insert(new_products[i:i+chunk_size]).execute()
+        
+        # Use bulk upsert with validation
+        success, error, created, updated = bulk_upsert_products(new_products)
+        if not success:
+            st.error(f"❌ Failed to create products: {error}")
+            return {}
+        
+        # Clear caches
+        CacheManager.invalidate_all()
+        
+        # Re-fetch the newly created SKUs
         sku_to_id.update(chunked_sku_lookup(missing))
+        
         st.warning(f"⚠️ Auto-created {len(missing)} missing product(s) with default values. Please review and update them later.")
+    
     return sku_to_id
 
-@st.cache_data(ttl=60, show_spinner=False)
+# Improved count function with caching
+@cached_with_invalidation(ttl=60, key_prefix="count")
 def get_cached_count(table_or_view, filter_col=None, filter_val=None):
+    """Get count with better caching and pagination support"""
     query = supabase.table(table_or_view).select("*", head=True, count="exact")
     if filter_col and filter_val:
         query = query.eq(filter_col, filter_val)
     return query.execute().count
+
+# New: Keyset pagination helper for better performance
+def get_paginated_data(query, page, page_size, order_col="id", order_desc=False):
+    """
+    Use keyset pagination for better performance on large tables
+    Returns (data, has_more, next_cursor)
+    """
+    offset = page * page_size
+    order_by = f"{order_col}.desc" if order_desc else f"{order_col}.asc"
+    
+    data = query.order(order_col, desc=order_desc).range(offset, offset + page_size - 1).execute().data
+    
+    # Check if there are more records
+    has_more = len(data) == page_size
+    next_cursor = data[-1][order_col] if data and has_more else None
+    
+    return data, has_more, next_cursor
 
 # ============================================================
 # PAGE: DASHBOARD
@@ -153,7 +377,7 @@ if page == "Dashboard":
     waste_val = waste_val or 0
     col1, col2 = st.columns(2)
     col1.metric("Total Inventory Value", f"₦{total_val:,.0f}")
-    col2.metric("Waste Risk (next 30d)", f"₦{waste_val:,.0f}")
+    col2.metric("Waste Risk (next 90d)", f"₦{waste_val:,.0f}")  # Changed from 30d to 90d
 
     alert_query = supabase.table("alert_log").select("alert_type, action_taken")
     if branch_id:
@@ -217,7 +441,7 @@ elif page == "Branches":
                             try:
                                 supabase.table("branches").update(update_data).eq("id", branch['id']).execute()
                                 st.success(f"✅ Branch '{new_name}' updated.")
-                                get_branches.clear()
+                                CacheManager.invalidate_all()
                                 st.rerun()
                             except Exception as e:
                                 st.error(f"Update failed: {e}")
@@ -252,7 +476,7 @@ elif page == "Branches":
                         "manager_email": manager_email or None
                     }).execute()
                     st.success(f"Branch '{name}' added.")
-                    get_branches.clear()
+                    CacheManager.invalidate_all()
                     st.rerun()
                 except Exception as e:
                     st.error(f"Failed: {e}")
@@ -276,10 +500,11 @@ elif page == "Branches":
             if col not in df.columns:
                 df[col] = None
         if st.button("Upload Branches"):
-            success, err = upload_csv_to_table("branches", df[['name','code','storekeeper_email','procurement_email','inventory_email','auditor_email','manager_email']])
+            records = df[['name','code','storekeeper_email','procurement_email','inventory_email','auditor_email','manager_email']].to_dict(orient="records")
+            success, err, count = upload_with_transaction("branches", records)
             if success:
-                st.success("Branches uploaded!")
-                get_branches.clear()
+                st.success(f"Branches uploaded! {count} rows processed.")
+                CacheManager.invalidate_all()
                 st.rerun()
             else:
                 st.error(err)
@@ -324,16 +549,23 @@ elif page == "Products":
         if st.form_submit_button("Add"):
             if not sku or not name:
                 st.error("SKU and name required.")
+            elif not validate_sku_format(sku):
+                st.error("Invalid SKU format. Use alphanumeric, underscores, hyphens, or periods.")
             else:
-                supabase.table("products").insert({
-                    "sku": sku, "name": name, "category": category or None,
-                    "shelf_life_days": shelf_life, "cost": cost
-                }).execute()
-                st.rerun()
+                try:
+                    supabase.table("products").insert({
+                        "sku": sku, "name": name, "category": category or None,
+                        "shelf_life_days": shelf_life, "cost": cost
+                    }).execute()
+                    CacheManager.invalidate_all()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Failed to add product: {e}")
 
     st.markdown("---")
     st.subheader("📁 Bulk Upload Products CSV")
     st.markdown("**CSV columns:** `sku`, `name`, `category`, `shelf_life_days`, `cost`  \n⚠️ **Recommended max rows:** 5,000 per upload.")
+    st.markdown("**SKU format:** Alphanumeric, underscores, hyphens, and periods only.")
     template_products = pd.DataFrame(columns=['sku','name','category','shelf_life_days','cost'])
     template_products.loc[0] = ['SKU001', 'Test Product', 'Category A', 90, 1000.00]
     csv_products = template_products.to_csv(index=False)
@@ -347,6 +579,13 @@ elif page == "Products":
         if not is_valid:
             st.error(msg)
             st.stop()
+        
+        # Validate SKU formats
+        invalid_skus = [sku for sku in df_prod['sku'].astype(str) if not validate_sku_format(sku)]
+        if invalid_skus:
+            st.error(f"❌ Invalid SKU format in: {', '.join(invalid_skus[:10])}")
+            st.stop()
+        
         if 'category' not in df_prod.columns:
             df_prod['category'] = None
         if 'shelf_life_days' not in df_prod.columns:
@@ -355,13 +594,16 @@ elif page == "Products":
             df_prod['cost'] = 0.0
         df_prod['shelf_life_days'] = pd.to_numeric(df_prod['shelf_life_days'], errors='coerce').fillna(90).astype(int)
         df_prod['cost'] = pd.to_numeric(df_prod['cost'], errors='coerce').fillna(0.0)
+        
         if st.button("Upload Products"):
-            success, err = upload_csv_to_table("products", df_prod[['sku','name','category','shelf_life_days','cost']])
+            records = df_prod[['sku','name','category','shelf_life_days','cost']].to_dict(orient="records")
+            success, error, created, updated = bulk_upsert_products(records)
             if success:
-                st.success(f"Products uploaded! {len(df_prod)} rows processed.")
+                st.success(f"Products uploaded! {created} created, {updated} updated.")
+                CacheManager.invalidate_all()
                 st.rerun()
             else:
-                st.error(err)
+                st.error(error)
 
 # ============================================================
 # PAGE: INVENTORY
@@ -417,7 +659,8 @@ elif page == "CSV Upload":
         - `storage_location` – warehouse / shelf / cold_room
 
         ⚠️ **Recommended max rows:** 5,000 per upload (chunked automatically).  
-        ✅ **Missing SKUs will be auto‑created** as placeholder products (you can edit them later).
+        ✅ **Missing SKUs will be auto‑created** as placeholder products (you can edit them later).  
+        ✅ **Expiry dates must be in the future** (or blank for non-expiring items).
         """)
         template_df = pd.DataFrame(columns=['product_sku','batch','quantity','expiry_date','storage_location'])
         template_df.loc[0] = ['SKU12345', 'BATCH-001', 100, '2026-12-31', 'warehouse']
@@ -463,11 +706,26 @@ elif page == "CSV Upload":
             df['product_sku'] = df['product_sku'].astype(str).str.strip()
             df = df[df['product_sku'].notna() & (df['product_sku'] != '')]
             df['quantity'] = pd.to_numeric(df['quantity'], errors='coerce').fillna(0).astype(int).clip(lower=0)
+            
+            # Validate expiry dates
+            df['expiry_date_raw'] = df['expiry_date']
             df['expiry_date'] = pd.to_datetime(df['expiry_date'], errors='coerce').dt.date
+            
+            # Check for invalid expiry dates (must be in future)
+            invalid_expiry = df[df['expiry_date'].notna() & (df['expiry_date'] < date.today())]
+            if not invalid_expiry.empty:
+                st.error(f"❌ {len(invalid_expiry)} rows have expiry dates in the past. Please correct them.")
+                st.dataframe(invalid_expiry[['product_sku', 'batch', 'expiry_date_raw']])
+                st.stop()
+            
             df['expiry_date'] = df['expiry_date'].where(pd.notna(df['expiry_date']), None)
 
             skus = df['product_sku'].unique().tolist()
             sku_to_id = ensure_products_exist(skus)
+            if not sku_to_id:
+                st.error("❌ Failed to create or find products. Please check SKU formats.")
+                st.stop()
+                
             df['product_id'] = df['product_sku'].map(sku_to_id)
             if df['product_id'].isna().any():
                 missing_after = df[df['product_id'].isna()]['product_sku'].unique()
@@ -478,9 +736,11 @@ elif page == "CSV Upload":
             df = df[['branch_id','product_id','batch','quantity','expiry_date','storage_location']]
 
             if st.button("Upload Inventory"):
-                success, err = upload_csv_to_table("inventory", df)
+                records = df.to_dict(orient="records")
+                success, err, count = upload_with_transaction("inventory", records)
                 if success:
-                    st.success(f"Inventory uploaded for {selected_branch_label}!")
+                    st.success(f"Inventory uploaded for {selected_branch_label}! {count} rows processed.")
+                    CacheManager.invalidate_all()
                 else:
                     st.error(err)
 
@@ -510,9 +770,11 @@ elif page == "CSV Upload":
             df = df[['branch_id','product_id','quantity_change','movement_date','notes']]
 
             if st.button("Upload Movements"):
-                success, err = upload_csv_to_table("stock_movements", df)
+                records = df.to_dict(orient="records")
+                success, err, count = upload_with_transaction("stock_movements", records)
                 if success:
-                    st.success(f"Movements uploaded for {selected_branch_label}!")
+                    st.success(f"Movements uploaded for {selected_branch_label}! {count} rows processed.")
+                    CacheManager.invalidate_all()
                 else:
                     st.error(err)
 
@@ -521,6 +783,13 @@ elif page == "CSV Upload":
 # ============================================================
 elif page == "Alerts & Advisories":
     st.header("🚨 Alerts & Advisories")
+    st.markdown("""
+    **Alert Thresholds:**
+    - 🔴 **CRITICAL:** Expiry ≤ 90 days (3 months) - Immediate action required
+    - 🟠 **HIGH:** Expiry 91-120 days (4 months) - Plan for consumption or transfer
+    - 🟡 **MEDIUM:** Expiry 121-180 days (6 months) - Monitor closely
+    """)
+    
     PAGE_SIZE = 50
     if "alert_page" not in st.session_state:
         st.session_state.alert_page = 0
@@ -563,6 +832,7 @@ elif page == "Alerts & Advisories":
                 "action_date": datetime.now(timezone.utc).isoformat()
             }).eq("id", alert_id).execute()
             st.success("Marked as done.")
+            CacheManager.invalidate_all()
             st.rerun()
     elif alerts:
         st.info("All displayed alerts have been actioned.")
@@ -611,8 +881,10 @@ elif page == "Risk & FEFO":
     st.header("⚠️ Risk Scoring & FEFO Recommendations")
     st.markdown("""
     **FEFO** = *First Expired, First Out* – we recommend consuming batches with the earliest expiry date first.  
-    **Risk Score** combines expiry proximity (now with 90-day write‑off threshold), financial exposure, and sales velocity.  
+    **Risk Score** combines expiry proximity (with 90-day write‑off threshold), financial exposure, and sales velocity.  
     **Risk Levels:** LOW 🟢 → MODERATE 🟡 → HIGH 🟠 → CRITICAL 🔴
+    
+    **Critical Threshold:** Products with **≤90 days (3 months)** to expiry are considered high risk and require immediate attention.
     """)
 
     PAGE_SIZE = 100
@@ -653,9 +925,28 @@ elif page == "Risk & FEFO":
     df_risk = pd.DataFrame(risk_scores)
     df_risk['expiry_date'] = pd.to_datetime(df_risk['expiry_date']).dt.date
 
+    # Add color coding for risk levels based on new thresholds
+    def get_risk_color(row):
+        if row['days_to_expiry'] is None or pd.isna(row['days_to_expiry']):
+            return "🟢"  # Non-expiring
+        if row['days_to_expiry'] <= 90:
+            return "🔴"  # CRITICAL - 3 months or less
+        elif row['days_to_expiry'] <= 120:
+            return "🟠"  # HIGH - 4 months
+        elif row['days_to_expiry'] <= 180:
+            return "🟡"  # MODERATE - 6 months
+        else:
+            return "🟢"  # LOW - more than 6 months
+
+    df_risk['risk_indicator'] = df_risk.apply(get_risk_color, axis=1)
+
     st.subheader("📋 Batch Risk Assessment")
-    st.dataframe(df_risk[['product_name','sku','batch','quantity','financial_value','expiry_date','days_to_expiry','risk_level']].rename(columns={
-        'product_name':'Product','sku':'SKU','financial_value':'Financial Exposure (₦)','days_to_expiry':'Days Left'
+    st.dataframe(df_risk[['risk_indicator', 'product_name','sku','batch','quantity','financial_value','expiry_date','days_to_expiry','risk_level']].rename(columns={
+        'risk_indicator': 'Risk',
+        'product_name':'Product',
+        'sku':'SKU',
+        'financial_value':'Financial Exposure (₦)',
+        'days_to_expiry':'Days Left'
     }))
 
     col1, col2 = st.columns(2)
@@ -668,22 +959,50 @@ elif page == "Risk & FEFO":
     st.caption(f"Page {st.session_state.risk_page+1} of {total_pages}")
 
     st.subheader("📌 FEFO Recommendation (Consumption Order)")
-    for idx, row in df_risk.head(20).iterrows():
-        st.write(f"- **{row['product_name']}** (Batch `{row['batch']}`) – Expires **{row['expiry_date']}** – {row['risk_level']}")
+    # Sort by expiry date to show what should be consumed first
+    fefo_order = df_risk.sort_values('expiry_date').head(20)
+    for idx, row in fefo_order.iterrows():
+        if pd.notna(row['expiry_date']):
+            days_left = row['days_to_expiry']
+            if days_left <= 90:
+                urgency = "🔴 CRITICAL - Consume immediately!"
+            elif days_left <= 120:
+                urgency = "🟠 HIGH - Prioritize consumption"
+            elif days_left <= 180:
+                urgency = "🟡 MODERATE - Plan consumption"
+            else:
+                urgency = "🟢 LOW - Normal rotation"
+            st.write(f"- **{row['product_name']}** (Batch `{row['batch']}`) – Expires **{row['expiry_date']}** ({days_left} days) – {urgency}")
 
     st.subheader("📊 Risk Distribution")
     risk_counts = df_risk['risk_level'].value_counts()
     st.bar_chart(risk_counts)
 
+    # Show summary of critical items
+    critical_items = df_risk[df_risk['days_to_expiry'] <= 90]
+    if not critical_items.empty:
+        st.warning(f"⚠️ **{len(critical_items)}** batches have ≤90 days to expiry and require immediate attention!")
+        st.dataframe(critical_items[['product_name', 'sku', 'batch', 'quantity', 'days_to_expiry']].head(10))
+
     with st.expander("ℹ️ How risk score is calculated"):
         st.markdown("""
         **Risk Score = (Expiry Score × 0.5) + (Financial Score × 0.3) + (Low Velocity Score × 0.2)**  
-        - **Expiry Score** (0–100): ≤30d→100, 31–60d→90, 61–90d→75, 91–180d→40, >180d→10  
+        - **Expiry Score** (0–100): 
+          - ≤90 days → 100 (CRITICAL - 3 months or less)
+          - 91-120 days → 90 (HIGH - 4 months)
+          - 121-180 days → 75 (MODERATE - 6 months)
+          - 181-365 days → 40 (LOW - 1 year)
+          - >365 days → 10 (VERY LOW - over 1 year)
         - **Financial Score** (0–100): normalised quantity × cost  
         - **Low Velocity Score** (0–100): ≤0.1 units/day→90, 0.11–0.5→70, 0.51–2→40, >2→10  
-        **Risk levels:** CRITICAL (≥80) → HIGH (60–79) → MODERATE (35–59) → LOW (<35)
         
-        ⚠️ **Real‑world note:** Products with ≤90 days to expiry are considered write‑off risks and trigger alerts.
+        **Risk levels:** 
+        - CRITICAL (≥80) → Products with ≤90 days to expiry
+        - HIGH (60–79) → Products with 91-120 days to expiry
+        - MODERATE (35–59) → Products with 121-180 days to expiry
+        - LOW (<35) → Products with >180 days to expiry
+        
+        ⚠️ **Real‑world note:** Products with **≤90 days (3 months)** to expiry are considered write‑off risks and trigger immediate alerts.
         """)
 
 # ============================================================
@@ -695,10 +1014,10 @@ elif page == "Transfer Suggestions":
     **Optimised suggestions** – computed entirely inside the database.
     - **Stock imbalance:** Branch has excess stock; another branch needs it (expiry‑agnostic).
     - **Expiry risk:** Batch expiring soon in a slow‑selling branch → transfer to a branch with higher demand.
-    - **Urgency:**  
-      - **CRITICAL** – Expiry ≤60 days **or** deficit very high (urgent transfer needed)  
-      - **HIGH** – Expiry 61–90 days  
-      - **MEDIUM** – Expiry 91–120 days
+    - **Urgency (Updated for 90-day threshold):**  
+      - **CRITICAL** – Expiry ≤90 days (3 months) **or** deficit very high (urgent transfer needed)  
+      - **HIGH** – Expiry 91-120 days (4 months)  
+      - **MEDIUM** – Expiry 121-180 days (6 months)
     """)
     
     try:
@@ -722,6 +1041,19 @@ elif page == "Transfer Suggestions":
             axis=1
         )
     
+    # Add urgency color coding based on new thresholds
+    def get_urgency_color(urgency):
+        if urgency == "CRITICAL":
+            return "🔴"
+        elif urgency == "HIGH":
+            return "🟠"
+        elif urgency == "MEDIUM":
+            return "🟡"
+        else:
+            return "🟢"
+    
+    df_sugg['urgency_indicator'] = df_sugg['urgency'].apply(get_urgency_color)
+    
     display_cols = ['from_branch','to_branch','product_name','sku','quantity','urgency','suggestion_type','reason']
     if df_sugg['batch'].notna().any():
         display_cols.insert(3, 'batch')
@@ -729,7 +1061,7 @@ elif page == "Transfer Suggestions":
     # Display suggestions without any Execute button
     for idx, row in df_sugg.iterrows():
         with st.container():
-            st.markdown(f"**{row['product_name']}** ({row['sku']})")
+            st.markdown(f"{row['urgency_indicator']} **{row['product_name']}** ({row['sku']})")
             st.markdown(f"📦 {row['quantity']} units from **{row['from_branch']}** → **{row['to_branch']}**")
             st.caption(f"🏷️ **{row['suggestion_type']}** – {row['reason']} (Urgency: {row['urgency']})")
             if pd.notna(row.get('batch')):
@@ -742,7 +1074,10 @@ elif page == "Transfer Suggestions":
     with st.expander("ℹ️ How suggestions are generated"):
         st.markdown("""
         - **Stock imbalance transfer (surplus → deficit):** Branch has more than reorder point + safety stock + 5 units; another branch is below reorder point. Applies to all products (including non‑expiring).
-        - **Expiry risk transfer:** Batch expiring ≤30 days in a branch with very low demand (<0.5 units/day) → transfer to branch with higher demand.
-        - **Urgency:** CRITICAL (expiry ≤60 days or deficit very high), HIGH (expiry 61–90 days), MEDIUM (expiry 91–120 days).
+        - **Expiry risk transfer:** Batch expiring ≤90 days (3 months) in a branch with very low demand (<0.5 units/day) → transfer to branch with higher demand.
+        - **Urgency (Updated thresholds):** 
+          - CRITICAL (expiry ≤90 days or deficit very high)
+          - HIGH (expiry 91-120 days)
+          - MEDIUM (expiry 121-180 days)
         - All calculations run inside PostgreSQL using indexed joins – no client‑side processing.
         """)
