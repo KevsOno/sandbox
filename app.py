@@ -85,12 +85,11 @@ if "alert_id" in params and "action" in params:
     st.rerun()
 
 # ---------- BRANCH SELECTOR ----------
-@cached_with_invalidation(ttl=3600, key_prefix="branches")  # 1 hour cache for branches
+@cached_with_invalidation(ttl=3600, key_prefix="branches")
 def get_branches():
     """Get branches with efficient single query"""
     return supabase.table("branches").select("id,name,code").execute().data
 
-# Cache branch lookup maps separately
 @cached_with_invalidation(ttl=3600, key_prefix="branch_maps")
 def get_branch_maps():
     """Pre-compute branch lookup maps to avoid repeated lookups"""
@@ -121,9 +120,11 @@ branch_id = None if selected_branch_name == "All Branches" else branch_maps['nam
 
 # ---------- NAVIGATION ----------
 if st.session_state.user_role == "admin":
-    pages = ["Dashboard", "Branches", "Products", "Inventory", "CSV Upload", "Alerts & Advisories", "Stock & Demand Limits", "Risk & FEFO", "Transfer Suggestions"]
+    pages = ["Dashboard", "Products & Inventory", "Branches", "CSV Upload", 
+             "Alerts & Advisories", "Stock & Demand Limits", "Risk & FEFO", "Transfer Suggestions"]
 else:
-    pages = ["Dashboard", "Products", "Inventory", "CSV Upload", "Alerts & Advisories", "Stock & Demand Limits", "Risk & FEFO", "Transfer Suggestions"]
+    pages = ["Dashboard", "Products & Inventory", "CSV Upload", 
+             "Alerts & Advisories", "Stock & Demand Limits", "Risk & FEFO", "Transfer Suggestions"]
 
 page = st.sidebar.radio("Go to", pages)
 
@@ -139,13 +140,12 @@ def validate_sku_format(sku):
     """Validate SKU format - alphanumeric, underscores, hyphens only"""
     if not sku or not isinstance(sku, str):
         return False
-    # Allow alphanumeric, underscores, hyphens, and periods
     return bool(re.match(r'^[A-Za-z0-9_\-\.]+$', sku))
 
 def validate_expiry_date(expiry_date):
     """Validate expiry date is in the future"""
     if expiry_date is None:
-        return True  # Non-expiring items are fine
+        return True
     if isinstance(expiry_date, str):
         try:
             expiry_date = datetime.strptime(expiry_date, '%Y-%m-%d').date()
@@ -155,16 +155,12 @@ def validate_expiry_date(expiry_date):
     return expiry_date >= today
 
 def upload_with_transaction(table_name, records, batch_size=500):
-    """
-    Upload with transaction-like behavior - if any batch fails, stop and report
-    Returns (success, error_message, successful_count)
-    """
+    """Upload with transaction-like behavior"""
     if not records:
         return True, None, 0
     
     total_records = len(records)
     successful = 0
-    failed_batch = None
     
     for i in range(0, total_records, batch_size):
         batch = records[i:i+batch_size]
@@ -172,7 +168,6 @@ def upload_with_transaction(table_name, records, batch_size=500):
         total_batches = (total_records + batch_size - 1) // batch_size
         
         try:
-            # Convert dates to ISO format for Supabase
             batch_clean = []
             for rec in batch:
                 rec_clean = {}
@@ -188,20 +183,15 @@ def upload_with_transaction(table_name, records, batch_size=500):
             supabase.table(table_name).insert(batch_clean).execute()
             successful += len(batch)
         except Exception as e:
-            failed_batch = batch_num
             return False, f"Upload failed at batch {batch_num}/{total_batches}. Error: {str(e)}", successful
     
     return True, None, successful
 
 def bulk_upsert_products(products_data, batch_size=200):
-    """
-    Upsert products with SKU validation and uniqueness check
-    Returns (success, error_message, created_count, updated_count)
-    """
+    """Upsert products with SKU validation and uniqueness check"""
     if not products_data:
         return True, None, 0, 0
     
-    # Validate all SKUs first
     invalid_skus = []
     for p in products_data:
         if not validate_sku_format(p.get('sku', '')):
@@ -210,23 +200,18 @@ def bulk_upsert_products(products_data, batch_size=200):
     if invalid_skus:
         return False, f"Invalid SKU format in: {', '.join(invalid_skus[:10])}", 0, 0
     
-    # Deduplicate by SKU
     sku_map = {}
     for p in products_data:
         sku = p['sku']
         if sku not in sku_map:
             sku_map[sku] = p
         else:
-            # Merge or keep first occurrence
             existing = sku_map[sku]
-            # Update with any new fields if they're missing
             for key, value in p.items():
                 if key not in existing or existing[key] is None:
                     existing[key] = value
     
     unique_products = list(sku_map.values())
-    
-    # Check which products already exist
     skus = [p['sku'] for p in unique_products]
     existing_skus = get_existing_skus(skus)
     
@@ -238,16 +223,13 @@ def bulk_upsert_products(products_data, batch_size=200):
         for product in batch:
             sku = product['sku']
             if sku in existing_skus:
-                # Update existing
                 try:
-                    # Remove id if present for update
                     product_clean = {k: v for k, v in product.items() if k != 'id'}
                     supabase.table("products").update(product_clean).eq("sku", sku).execute()
                     updated_count += 1
                 except Exception as e:
                     return False, f"Update failed for SKU {sku}: {str(e)}", created_count, updated_count
             else:
-                # Insert new
                 try:
                     product_clean = {k: v for k, v in product.items() if k != 'id'}
                     supabase.table("products").insert(product_clean).execute()
@@ -262,7 +244,6 @@ def get_existing_skus(sku_list=None):
     """Get existing SKUs from products table with caching"""
     query = supabase.table("products").select("sku")
     if sku_list:
-        # Chunk the query to avoid URL length limits
         all_skus = set()
         for i in range(0, len(sku_list), 500):
             chunk = sku_list[i:i+500]
@@ -270,7 +251,6 @@ def get_existing_skus(sku_list=None):
             all_skus.update([r['sku'] for r in result.data])
         return all_skus
     else:
-        # Get all SKUs (use pagination for large datasets)
         all_skus = set()
         offset = 0
         while True:
@@ -304,7 +284,6 @@ def ensure_products_exist(skus, default_cost=0.0, default_shelf_life=90):
     missing = [sku for sku in skus if sku not in sku_to_id]
     
     if missing:
-        # Validate SKUs before creating
         invalid_skus = [sku for sku in missing if not validate_sku_format(sku)]
         if invalid_skus:
             st.error(f"❌ Invalid SKU format in: {', '.join(invalid_skus[:10])}")
@@ -320,23 +299,17 @@ def ensure_products_exist(skus, default_cost=0.0, default_shelf_life=90):
                 "cost": default_cost
             })
         
-        # Use bulk upsert with validation
         success, error, created, updated = bulk_upsert_products(new_products)
         if not success:
             st.error(f"❌ Failed to create products: {error}")
             return {}
         
-        # Clear caches
         CacheManager.invalidate_all()
-        
-        # Re-fetch the newly created SKUs
         sku_to_id.update(chunked_sku_lookup(missing))
-        
         st.warning(f"⚠️ Auto-created {len(missing)} missing product(s) with default values. Please review and update them later.")
     
     return sku_to_id
 
-# Improved count function with caching
 @cached_with_invalidation(ttl=60, key_prefix="count")
 def get_cached_count(table_or_view, filter_col=None, filter_val=None):
     """Get count with better caching and pagination support"""
@@ -345,22 +318,73 @@ def get_cached_count(table_or_view, filter_col=None, filter_val=None):
         query = query.eq(filter_col, filter_val)
     return query.execute().count
 
-# New: Keyset pagination helper for better performance
-def get_paginated_data(query, page, page_size, order_col="id", order_desc=False):
-    """
-    Use keyset pagination for better performance on large tables
-    Returns (data, has_more, next_cursor)
-    """
-    offset = page * page_size
-    order_by = f"{order_col}.desc" if order_desc else f"{order_col}.asc"
+def search_products(search_term, branch_id=None, limit=100):
+    """Search products by SKU or name with inventory info"""
+    search_term = search_term.strip()
+    if not search_term:
+        return []
     
-    data = query.order(order_col, desc=order_desc).range(offset, offset + page_size - 1).execute().data
+    # First, find matching products
+    product_query = supabase.table("products").select(
+        "id,sku,name,category,shelf_life_days,cost"
+    ).or_(
+        f"sku.ilike.%{search_term}%,name.ilike.%{search_term}%"
+    ).limit(limit)
     
-    # Check if there are more records
-    has_more = len(data) == page_size
-    next_cursor = data[-1][order_col] if data and has_more else None
+    products = product_query.execute().data
     
-    return data, has_more, next_cursor
+    if not products:
+        return []
+    
+    # Get inventory for these products if branch is selected
+    product_ids = [p['id'] for p in products]
+    
+    if branch_id:
+        inventory_query = supabase.table("view_inventory_list").select(
+            "product_id,batch,quantity,expiry_date,storage_location"
+        ).in_("product_id", product_ids).eq("branch_id", branch_id)
+        inventory = inventory_query.execute().data
+        
+        # Group inventory by product_id
+        inv_by_product = {}
+        for inv in inventory:
+            prod_id = inv['product_id']
+            if prod_id not in inv_by_product:
+                inv_by_product[prod_id] = []
+            inv_by_product[prod_id].append(inv)
+        
+        # Add inventory to products
+        for product in products:
+            product['inventory'] = inv_by_product.get(product['id'], [])
+    else:
+        # Show all branches inventory
+        for product in products:
+            inventory_query = supabase.table("view_inventory_list").select(
+                "branch_name,batch,quantity,expiry_date,storage_location"
+            ).eq("product_id", product['id'])
+            product['inventory'] = inventory_query.execute().data
+    
+    return products
+
+def search_inventory(search_term, branch_id=None, limit=100):
+    """Search inventory by product SKU, name, or batch"""
+    search_term = search_term.strip()
+    if not search_term:
+        return []
+    
+    query = supabase.table("view_inventory_list").select(
+        "id,branch_id,branch_name,product_id,product_name,sku,batch,quantity,expiry_date,storage_location,cost"
+    )
+    
+    if branch_id:
+        query = query.eq("branch_id", branch_id)
+    
+    # Search across multiple fields
+    query = query.or_(
+        f"sku.ilike.%{search_term}%,product_name.ilike.%{search_term}%,batch.ilike.%{search_term}%"
+    ).limit(limit)
+    
+    return query.execute().data
 
 # ============================================================
 # PAGE: DASHBOARD
@@ -377,7 +401,7 @@ if page == "Dashboard":
     waste_val = waste_val or 0
     col1, col2 = st.columns(2)
     col1.metric("Total Inventory Value", f"₦{total_val:,.0f}")
-    col2.metric("Waste Risk (next 90d)", f"₦{waste_val:,.0f}")  # Changed from 30d to 90d
+    col2.metric("Waste Risk (next 90d)", f"₦{waste_val:,.0f}")
 
     alert_query = supabase.table("alert_log").select("alert_type, action_taken")
     if branch_id:
@@ -393,6 +417,258 @@ if page == "Dashboard":
         st.bar_chart(df_a['alert_type'].value_counts())
     else:
         st.info("No alerts yet. Run daily maintenance function.")
+
+# ============================================================
+# PAGE: PRODUCTS & INVENTORY (MERGED WITH SEARCH)
+# ============================================================
+elif page == "Products & Inventory":
+    st.header("📦 Products & Inventory Management")
+    
+    # Search and filter section
+    st.subheader("🔍 Search Products & Inventory")
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        search_term = st.text_input("Search by SKU, Product Name, or Batch", 
+                                   placeholder="e.g., SKU123, Paracetamol, BATCH-001",
+                                   key="product_search")
+    with col2:
+        search_type = st.selectbox("Search in", ["Products", "Inventory"], key="search_type")
+    
+    # Action buttons for quick operations
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        if st.button("➕ Add Product", use_container_width=True):
+            st.session_state.show_add_product = True
+    with col2:
+        if st.button("📊 View All Products", use_container_width=True):
+            st.session_state.show_all_products = True
+            st.session_state.show_inventory = False
+    with col3:
+        if st.button("📦 View All Inventory", use_container_width=True):
+            st.session_state.show_inventory = True
+            st.session_state.show_all_products = False
+    with col4:
+        if st.button("🔄 Refresh Data", use_container_width=True):
+            CacheManager.invalidate_all()
+            st.rerun()
+    
+    st.divider()
+    
+    # Initialize session state for views
+    if "show_add_product" not in st.session_state:
+        st.session_state.show_add_product = False
+    if "show_all_products" not in st.session_state:
+        st.session_state.show_all_products = True
+    if "show_inventory" not in st.session_state:
+        st.session_state.show_inventory = False
+    
+    # Handle add product form
+    if st.session_state.show_add_product:
+        with st.expander("➕ Add New Product", expanded=True):
+            with st.form("add_product_form"):
+                col1, col2 = st.columns(2)
+                with col1:
+                    new_sku = st.text_input("SKU*", help="Alphanumeric, underscores, hyphens, or periods")
+                    new_name = st.text_input("Product Name*")
+                with col2:
+                    new_category = st.text_input("Category")
+                    new_shelf_life = st.number_input("Shelf Life (days)", min_value=1, value=90)
+                    new_cost = st.number_input("Unit Cost (₦)", min_value=0.0, value=0.0, format="%.2f")
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.form_submit_button("✅ Add Product", use_container_width=True):
+                        if not new_sku or not new_name:
+                            st.error("SKU and name are required.")
+                        elif not validate_sku_format(new_sku):
+                            st.error("Invalid SKU format. Use alphanumeric, underscores, hyphens, or periods.")
+                        else:
+                            try:
+                                supabase.table("products").insert({
+                                    "sku": new_sku,
+                                    "name": new_name,
+                                    "category": new_category or None,
+                                    "shelf_life_days": new_shelf_life,
+                                    "cost": new_cost
+                                }).execute()
+                                st.success(f"✅ Product '{new_name}' added successfully!")
+                                CacheManager.invalidate_all()
+                                st.session_state.show_add_product = False
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Failed to add product: {e}")
+                with col2:
+                    if st.form_submit_button("❌ Cancel", use_container_width=True):
+                        st.session_state.show_add_product = False
+                        st.rerun()
+    
+    # Search results or default views
+    if search_term:
+        if search_type == "Products":
+            results = search_products(search_term, branch_id)
+            if results:
+                st.success(f"Found {len(results)} products matching '{search_term}'")
+                for product in results:
+                    with st.expander(f"📦 {product['name']} ({product['sku']})"):
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("Category", product.get('category', 'N/A'))
+                            st.metric("Shelf Life", f"{product.get('shelf_life_days', 'N/A')} days")
+                        with col2:
+                            st.metric("Cost", f"₦{product.get('cost', 0):,.2f}")
+                            if product.get('inventory'):
+                                total_qty = sum(inv['quantity'] for inv in product['inventory'])
+                                st.metric("Total Stock", total_qty)
+                        with col3:
+                            if st.button(f"✏️ Edit {product['sku']}", key=f"edit_{product['id']}"):
+                                st.session_state.edit_product = product
+                        
+                        # Show inventory for this product
+                        if product.get('inventory'):
+                            st.subheader("Inventory Locations")
+                            inv_df = pd.DataFrame(product['inventory'])
+                            if 'branch_name' in inv_df.columns:
+                                display_cols = ['branch_name', 'batch', 'quantity', 'expiry_date', 'storage_location']
+                            else:
+                                display_cols = ['batch', 'quantity', 'expiry_date', 'storage_location']
+                            st.dataframe(inv_df[display_cols])
+            else:
+                st.info(f"No products found matching '{search_term}'")
+        
+        else:  # Search inventory
+            results = search_inventory(search_term, branch_id)
+            if results:
+                st.success(f"Found {len(results)} inventory records matching '{search_term}'")
+                df_results = pd.DataFrame(results)
+                df_results['expiry_display'] = df_results['expiry_date'].apply(lambda x: x if pd.notna(x) else "No expiry")
+                st.dataframe(df_results[['branch_name', 'product_name', 'sku', 'batch', 'quantity', 'expiry_display', 'storage_location']])
+                
+                # Quick action: Adjust inventory
+                st.subheader("⚡ Quick Inventory Adjustment")
+                selected_item = st.selectbox("Select inventory item to adjust", 
+                                           [f"{row['sku']} - {row['batch']}" for row in results])
+                if selected_item:
+                    selected_row = results[[f"{row['sku']} - {row['batch']}" == selected_item for row in results].index(True)]
+                    new_qty = st.number_input("New Quantity", min_value=0, value=selected_row['quantity'])
+                    if st.button("Update Quantity"):
+                        try:
+                            supabase.table("inventory").update({"quantity": new_qty}).eq("id", selected_row['id']).execute()
+                            st.success("✅ Inventory updated!")
+                            CacheManager.invalidate_all()
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Failed to update: {e}")
+            else:
+                st.info(f"No inventory records found matching '{search_term}'")
+    
+    else:
+        # Default view: Show products or inventory based on session state
+        if st.session_state.show_inventory:
+            st.subheader("📊 All Inventory")
+            PAGE_SIZE = 50
+            if "inv_page" not in st.session_state:
+                st.session_state.inv_page = 0
+            offset = st.session_state.inv_page * PAGE_SIZE
+            
+            total = get_cached_count("view_inventory_list", filter_col="branch_id" if branch_id else None,
+                                   filter_val=branch_id if branch_id else None)
+            total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
+            
+            query = supabase.table("view_inventory_list").select(
+                "id,branch_id,branch_name,product_id,product_name,sku,cost,batch,quantity,expiry_date,storage_location"
+            )
+            if branch_id:
+                query = query.eq("branch_id", branch_id)
+            inv_data = query.range(offset, offset+PAGE_SIZE-1).execute().data
+            
+            if inv_data:
+                df_i = pd.DataFrame(inv_data)
+                df_i['expiry_display'] = df_i['expiry_date'].apply(lambda x: x if pd.notna(x) else "No expiry")
+                st.dataframe(df_i[['branch_name','product_name','sku','batch','quantity','expiry_display','storage_location']].rename(columns={
+                    'branch_name':'Branch','product_name':'Product','expiry_display':'Expiry Date'
+                }))
+                
+                col1, col2 = st.columns(2)
+                if col1.button("⬅️ Prev", disabled=st.session_state.inv_page==0):
+                    st.session_state.inv_page -= 1
+                    st.rerun()
+                if col2.button("Next ➡️", disabled=st.session_state.inv_page>=total_pages-1):
+                    st.session_state.inv_page += 1
+                    st.rerun()
+                st.caption(f"Page {st.session_state.inv_page+1} of {total_pages}")
+            else:
+                st.info("No inventory records found.")
+        
+        else:  # Show products
+            st.subheader("📋 All Products")
+            PAGE_SIZE = 50
+            if "prod_page" not in st.session_state:
+                st.session_state.prod_page = 0
+            offset = st.session_state.prod_page * PAGE_SIZE
+            
+            total = get_cached_count("products")
+            total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
+            
+            prods = supabase.table("products").select("id,sku,name,category,shelf_life_days,cost").range(offset, offset+PAGE_SIZE-1).execute().data
+            
+            if prods:
+                # Add edit functionality directly in the dataframe display
+                df_p = pd.DataFrame(prods)
+                st.dataframe(df_p[['sku','name','category','shelf_life_days','cost']])
+                
+                col1, col2 = st.columns(2)
+                if col1.button("⬅️ Prev", disabled=st.session_state.prod_page==0):
+                    st.session_state.prod_page -= 1
+                    st.rerun()
+                if col2.button("Next ➡️", disabled=st.session_state.prod_page>=total_pages-1):
+                    st.session_state.prod_page += 1
+                    st.rerun()
+                st.caption(f"Page {st.session_state.prod_page+1} of {total_pages}")
+                
+                # Edit product section
+                st.subheader("✏️ Edit Product")
+                edit_sku = st.selectbox("Select product to edit", [p['sku'] for p in prods])
+                if edit_sku:
+                    product = next(p for p in prods if p['sku'] == edit_sku)
+                    with st.form("edit_product_form"):
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            new_name = st.text_input("Product Name", value=product['name'])
+                            new_category = st.text_input("Category", value=product.get('category', ''))
+                        with col2:
+                            new_shelf_life = st.number_input("Shelf Life (days)", min_value=1, value=product['shelf_life_days'])
+                            new_cost = st.number_input("Unit Cost (₦)", min_value=0.0, value=float(product['cost']), format="%.2f")
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            if st.form_submit_button("💾 Save Changes", use_container_width=True):
+                                try:
+                                    supabase.table("products").update({
+                                        "name": new_name,
+                                        "category": new_category or None,
+                                        "shelf_life_days": new_shelf_life,
+                                        "cost": new_cost
+                                    }).eq("id", product['id']).execute()
+                                    st.success("✅ Product updated successfully!")
+                                    CacheManager.invalidate_all()
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Failed to update: {e}")
+                        with col2:
+                            if st.form_submit_button("🗑️ Delete Product", use_container_width=True):
+                                if st.warning("Are you sure? This will delete the product and all associated inventory."):
+                                    try:
+                                        # Delete inventory first
+                                        supabase.table("inventory").delete().eq("product_id", product['id']).execute()
+                                        # Then delete product
+                                        supabase.table("products").delete().eq("id", product['id']).execute()
+                                        st.success("✅ Product and associated inventory deleted.")
+                                        CacheManager.invalidate_all()
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(f"Failed to delete: {e}")
+            else:
+                st.info("No products found. Add your first product above!")
 
 # ============================================================
 # PAGE: BRANCHES (admin only)
@@ -510,143 +786,21 @@ elif page == "Branches":
                 st.error(err)
 
 # ============================================================
-# PAGE: PRODUCTS
-# ============================================================
-elif page == "Products":
-    st.header("📦 Products Master")
-    PAGE_SIZE = 50
-    if "prod_page" not in st.session_state:
-        st.session_state.prod_page = 0
-    offset = st.session_state.prod_page * PAGE_SIZE
-
-    total = get_cached_count("products")
-    total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
-
-    prods = supabase.table("products").select("id,sku,name,category,shelf_life_days,cost").range(offset, offset+PAGE_SIZE-1).execute().data
-    if prods:
-        df_p = pd.DataFrame(prods)
-        st.dataframe(df_p[['sku','name','category','shelf_life_days','cost']])
-    else:
-        st.info("No products yet.")
-
-    col1, col2 = st.columns(2)
-    if col1.button("Prev", disabled=st.session_state.prod_page==0):
-        st.session_state.prod_page -= 1
-        st.rerun()
-    if col2.button("Next", disabled=st.session_state.prod_page>=total_pages-1):
-        st.session_state.prod_page += 1
-        st.rerun()
-    st.caption(f"Page {st.session_state.prod_page+1} of {total_pages}")
-
-    st.markdown("---")
-    st.subheader("➕ Add Single Product")
-    with st.form("add_product"):
-        sku = st.text_input("SKU*")
-        name = st.text_input("Product Name*")
-        category = st.text_input("Category")
-        shelf_life = st.number_input("Shelf Life (days)", min_value=1, value=90)
-        cost = st.number_input("Unit Cost (₦)", min_value=0.0, value=0.0, format="%.2f")
-        if st.form_submit_button("Add"):
-            if not sku or not name:
-                st.error("SKU and name required.")
-            elif not validate_sku_format(sku):
-                st.error("Invalid SKU format. Use alphanumeric, underscores, hyphens, or periods.")
-            else:
-                try:
-                    supabase.table("products").insert({
-                        "sku": sku, "name": name, "category": category or None,
-                        "shelf_life_days": shelf_life, "cost": cost
-                    }).execute()
-                    CacheManager.invalidate_all()
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Failed to add product: {e}")
-
-    st.markdown("---")
-    st.subheader("📁 Bulk Upload Products CSV")
-    st.markdown("**CSV columns:** `sku`, `name`, `category`, `shelf_life_days`, `cost`  \n⚠️ **Recommended max rows:** 5,000 per upload.")
-    st.markdown("**SKU format:** Alphanumeric, underscores, hyphens, and periods only.")
-    template_products = pd.DataFrame(columns=['sku','name','category','shelf_life_days','cost'])
-    template_products.loc[0] = ['SKU001', 'Test Product', 'Category A', 90, 1000.00]
-    csv_products = template_products.to_csv(index=False)
-    st.download_button("📥 Download Products CSV Template", csv_products, "products_template.csv", "text/csv")
-    uploaded_products = st.file_uploader("Choose products CSV", type="csv", key="products_csv_upload")
-    if uploaded_products:
-        df_prod = pd.read_csv(uploaded_products)
-        st.dataframe(df_prod.head())
-        required_prod = {'sku','name'}
-        is_valid, msg = validate_csv_columns(df_prod, required_prod, "products CSV")
-        if not is_valid:
-            st.error(msg)
-            st.stop()
-        
-        # Validate SKU formats
-        invalid_skus = [sku for sku in df_prod['sku'].astype(str) if not validate_sku_format(sku)]
-        if invalid_skus:
-            st.error(f"❌ Invalid SKU format in: {', '.join(invalid_skus[:10])}")
-            st.stop()
-        
-        if 'category' not in df_prod.columns:
-            df_prod['category'] = None
-        if 'shelf_life_days' not in df_prod.columns:
-            df_prod['shelf_life_days'] = 90
-        if 'cost' not in df_prod.columns:
-            df_prod['cost'] = 0.0
-        df_prod['shelf_life_days'] = pd.to_numeric(df_prod['shelf_life_days'], errors='coerce').fillna(90).astype(int)
-        df_prod['cost'] = pd.to_numeric(df_prod['cost'], errors='coerce').fillna(0.0)
-        
-        if st.button("Upload Products"):
-            records = df_prod[['sku','name','category','shelf_life_days','cost']].to_dict(orient="records")
-            success, error, created, updated = bulk_upsert_products(records)
-            if success:
-                st.success(f"Products uploaded! {created} created, {updated} updated.")
-                CacheManager.invalidate_all()
-                st.rerun()
-            else:
-                st.error(error)
-
-# ============================================================
-# PAGE: INVENTORY
-# ============================================================
-elif page == "Inventory":
-    st.header("📦 Current Inventory")
-    PAGE_SIZE = 100
-    if "inv_page" not in st.session_state:
-        st.session_state.inv_page = 0
-    offset = st.session_state.inv_page * PAGE_SIZE
-
-    total = get_cached_count("view_inventory_list", filter_col="branch_id" if branch_id else None,
-                             filter_val=branch_id if branch_id else None)
-    total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
-
-    query = supabase.table("view_inventory_list").select("id,branch_id,branch_name,product_id,product_name,sku,cost,batch,quantity,expiry_date,storage_location")
-    if branch_id:
-        query = query.eq("branch_id", branch_id)
-    inv_data = query.range(offset, offset+PAGE_SIZE-1).execute().data
-
-    if inv_data:
-        df_i = pd.DataFrame(inv_data)
-        df_i['expiry_display'] = df_i['expiry_date'].apply(lambda x: x if pd.notna(x) else "No expiry")
-        st.dataframe(df_i[['branch_name','product_name','sku','batch','quantity','expiry_display','storage_location']].rename(columns={
-            'branch_name':'Branch','product_name':'Product','expiry_display':'Expiry Date'
-        }))
-    else:
-        st.info("No inventory records.")
-
-    col1, col2 = st.columns(2)
-    if col1.button("Prev Inv", disabled=st.session_state.inv_page==0):
-        st.session_state.inv_page -= 1
-        st.rerun()
-    if col2.button("Next Inv", disabled=st.session_state.inv_page>=total_pages-1):
-        st.session_state.inv_page += 1
-        st.rerun()
-    st.caption(f"Page {st.session_state.inv_page+1} of {total_pages}")
-
-# ============================================================
-# PAGE: CSV UPLOAD
+# PAGE: CSV UPLOAD (with search for products)
 # ============================================================
 elif page == "CSV Upload":
     st.header("📁 Upload Inventory or Movement Data")
+    
+    # Quick search for products before upload
+    with st.expander("🔍 Search Products Before Upload", expanded=False):
+        search_term = st.text_input("Search products", placeholder="SKU or product name", key="upload_search")
+        if search_term:
+            results = search_products(search_term, branch_id, limit=20)
+            if results:
+                st.dataframe(pd.DataFrame(results)[['sku', 'name', 'category', 'cost']])
+            else:
+                st.info("No products found")
+    
     upload_type = st.selectbox("Data Type", ["Inventory (current stock)", "Stock Movements (sales/restock)"])
 
     if upload_type == "Inventory (current stock)":
@@ -707,11 +861,9 @@ elif page == "CSV Upload":
             df = df[df['product_sku'].notna() & (df['product_sku'] != '')]
             df['quantity'] = pd.to_numeric(df['quantity'], errors='coerce').fillna(0).astype(int).clip(lower=0)
             
-            # Validate expiry dates
             df['expiry_date_raw'] = df['expiry_date']
             df['expiry_date'] = pd.to_datetime(df['expiry_date'], errors='coerce').dt.date
             
-            # Check for invalid expiry dates (must be in future)
             invalid_expiry = df[df['expiry_date'].notna() & (df['expiry_date'] < date.today())]
             if not invalid_expiry.empty:
                 st.error(f"❌ {len(invalid_expiry)} rows have expiry dates in the past. Please correct them.")
@@ -838,7 +990,7 @@ elif page == "Alerts & Advisories":
         st.info("All displayed alerts have been actioned.")
 
 # ============================================================
-# PAGE: STOCK & DEMAND LIMITS (renamed)
+# PAGE: STOCK & DEMAND LIMITS
 # ============================================================
 elif page == "Stock & Demand Limits":
     st.header("📊 Stock & Demand Limits")
@@ -925,18 +1077,17 @@ elif page == "Risk & FEFO":
     df_risk = pd.DataFrame(risk_scores)
     df_risk['expiry_date'] = pd.to_datetime(df_risk['expiry_date']).dt.date
 
-    # Add color coding for risk levels based on new thresholds
     def get_risk_color(row):
         if row['days_to_expiry'] is None or pd.isna(row['days_to_expiry']):
-            return "🟢"  # Non-expiring
+            return "🟢"
         if row['days_to_expiry'] <= 90:
-            return "🔴"  # CRITICAL - 3 months or less
+            return "🔴"
         elif row['days_to_expiry'] <= 120:
-            return "🟠"  # HIGH - 4 months
+            return "🟠"
         elif row['days_to_expiry'] <= 180:
-            return "🟡"  # MODERATE - 6 months
+            return "🟡"
         else:
-            return "🟢"  # LOW - more than 6 months
+            return "🟢"
 
     df_risk['risk_indicator'] = df_risk.apply(get_risk_color, axis=1)
 
@@ -959,7 +1110,6 @@ elif page == "Risk & FEFO":
     st.caption(f"Page {st.session_state.risk_page+1} of {total_pages}")
 
     st.subheader("📌 FEFO Recommendation (Consumption Order)")
-    # Sort by expiry date to show what should be consumed first
     fefo_order = df_risk.sort_values('expiry_date').head(20)
     for idx, row in fefo_order.iterrows():
         if pd.notna(row['expiry_date']):
@@ -978,7 +1128,6 @@ elif page == "Risk & FEFO":
     risk_counts = df_risk['risk_level'].value_counts()
     st.bar_chart(risk_counts)
 
-    # Show summary of critical items
     critical_items = df_risk[df_risk['days_to_expiry'] <= 90]
     if not critical_items.empty:
         st.warning(f"⚠️ **{len(critical_items)}** batches have ≤90 days to expiry and require immediate attention!")
@@ -1006,7 +1155,7 @@ elif page == "Risk & FEFO":
         """)
 
 # ============================================================
-# PAGE: TRANSFER SUGGESTIONS (suggestions only – no execute button)
+# PAGE: TRANSFER SUGGESTIONS
 # ============================================================
 elif page == "Transfer Suggestions":
     st.header("🔄 Inter‑Branch Transfer Suggestions")
@@ -1041,7 +1190,6 @@ elif page == "Transfer Suggestions":
             axis=1
         )
     
-    # Add urgency color coding based on new thresholds
     def get_urgency_color(urgency):
         if urgency == "CRITICAL":
             return "🔴"
@@ -1054,11 +1202,6 @@ elif page == "Transfer Suggestions":
     
     df_sugg['urgency_indicator'] = df_sugg['urgency'].apply(get_urgency_color)
     
-    display_cols = ['from_branch','to_branch','product_name','sku','quantity','urgency','suggestion_type','reason']
-    if df_sugg['batch'].notna().any():
-        display_cols.insert(3, 'batch')
-    
-    # Display suggestions without any Execute button
     for idx, row in df_sugg.iterrows():
         with st.container():
             st.markdown(f"{row['urgency_indicator']} **{row['product_name']}** ({row['sku']})")
