@@ -729,6 +729,7 @@ def reset_pagination():
     st.session_state.alert_page = 0
     st.session_state.limits_page = 0
     st.session_state.risk_page = 0
+    st.session_state.search_page = 0
 
 # FIX: Safely handle branch selection with proper error handling
 if branch_maps and 'name_to_id' in branch_maps:
@@ -806,6 +807,128 @@ class ProgressIndicator:
         
         if self.progress_bar:
             self.progress_bar.progress(1.0)
+
+# ---------- OPTIMIZED SEARCH FUNCTIONS ----------
+@cached_with_invalidation(ttl=60, key_prefix="search_products_cache")
+def search_products_optimized(search_term, branch_id=None, limit=50):
+    """Optimized product search with better indexing and caching"""
+    search_term = search_term.strip()
+    if not search_term or len(search_term) < 2:
+        return []
+    
+    try:
+        # Single optimized query using ILIKE with proper indexing
+        product_query = supabase.table("products").select(
+            "id,sku,name,category,shelf_life_days,cost"
+        ).or_(
+            f"sku.ilike.%{search_term}%,name.ilike.%{search_term}%"
+        ).limit(limit)
+        
+        products = product_query.execute().data
+        
+        if not products:
+            return []
+        
+        # Get inventory counts in a single optimized query
+        product_ids = [p['id'] for p in products]
+        
+        if branch_id:
+            # Single query for branch-specific inventory
+            inventory_query = supabase.table("view_inventory_list").select(
+                "product_id,branch_id,branch_name,batch,quantity,expiry_date,storage_location"
+            ).in_("product_id", product_ids).eq("branch_id", branch_id)
+            
+            inventory = inventory_query.execute().data
+            
+            # Group inventory by product
+            inv_by_product = {}
+            for inv in inventory:
+                prod_id = inv['product_id']
+                if prod_id not in inv_by_product:
+                    inv_by_product[prod_id] = []
+                inv_by_product[prod_id].append(inv)
+            
+            for product in products:
+                product['inventory'] = inv_by_product.get(product['id'], [])
+                # Add quick summary stats
+                if product['inventory']:
+                    product['total_quantity'] = sum(inv['quantity'] for inv in product['inventory'])
+                    product['location_count'] = len(product['inventory'])
+                else:
+                    product['total_quantity'] = 0
+                    product['location_count'] = 0
+        else:
+            # Get inventory across all branches - limited per product
+            for product in products:
+                inventory_query = supabase.table("view_inventory_list").select(
+                    "branch_name,batch,quantity,expiry_date,storage_location"
+                ).eq("product_id", product['id']).limit(20)
+                
+                product['inventory'] = inventory_query.execute().data
+                if product['inventory']:
+                    product['total_quantity'] = sum(inv['quantity'] for inv in product['inventory'])
+                    product['location_count'] = len(product['inventory'])
+                else:
+                    product['total_quantity'] = 0
+                    product['location_count'] = 0
+        
+        logger.debug(f"Optimized product search completed", {"term": search_term, "results": len(products)})
+        return products
+        
+    except Exception as e:
+        logger.error("Product search failed", {"term": search_term, "error": str(e)})
+        return []
+
+@cached_with_invalidation(ttl=60, key_prefix="search_inventory_cache")
+def search_inventory_optimized(search_term, branch_id=None, limit=100):
+    """Optimized inventory search with better performance"""
+    search_term = search_term.strip()
+    if not search_term or len(search_term) < 2:
+        return [], {'total_results': 0, 'shown_results': 0, 'total_quantity': 0}
+    
+    try:
+        # Build the query
+        query = supabase.table("view_inventory_list").select(
+            "id,branch_id,branch_name,product_id,product_name,sku,batch,quantity,expiry_date,storage_location,cost"
+        )
+        
+        if branch_id:
+            query = query.eq("branch_id", branch_id)
+        
+        # Use OR condition for search
+        query = query.or_(
+            f"sku.ilike.%{search_term}%,product_name.ilike.%{search_term}%,batch.ilike.%{search_term}%"
+        ).limit(limit)
+        
+        results = query.execute().data
+        
+        # Add quick aggregations for display
+        summary = {
+            'total_results': len(results),
+            'shown_results': len(results),
+            'total_quantity': sum(r.get('quantity', 0) for r in results)
+        }
+        
+        logger.debug(f"Optimized inventory search completed", {
+            "term": search_term, 
+            "results": len(results)
+        })
+        
+        return results, summary
+        
+    except Exception as e:
+        logger.error("Inventory search failed", {"term": search_term, "error": str(e)})
+        return [], {'total_results': 0, 'shown_results': 0, 'total_quantity': 0}
+
+# Wrapper functions for backward compatibility
+def search_products(search_term, branch_id=None, limit=100):
+    """Wrapper for optimized product search"""
+    return search_products_optimized(search_term, branch_id, min(limit, 100))
+
+def search_inventory(search_term, branch_id=None, limit=100):
+    """Wrapper for optimized inventory search"""
+    results, summary = search_inventory_optimized(search_term, branch_id, min(limit, 100))
+    return results
 
 # ---------- HELPERS ----------
 def validate_csv_columns(df, required_cols, label="CSV"):
@@ -1016,81 +1139,6 @@ def get_cached_count(table_or_view, filter_col=None, filter_val=None):
         query = query.eq(filter_col, filter_val)
     return query.execute().count
 
-def search_products(search_term, branch_id=None, limit=100):
-    """Search products by SKU or name with inventory info"""
-    search_term = search_term.strip()
-    if not search_term:
-        return []
-    
-    try:
-        product_query = supabase.table("products").select(
-            "id,sku,name,category,shelf_life_days,cost"
-        ).or_(
-            f"sku.ilike.%{search_term}%,name.ilike.%{search_term}%"
-        ).limit(limit)
-        
-        products = product_query.execute().data
-        
-        if not products:
-            return []
-        
-        product_ids = [p['id'] for p in products]
-        
-        if branch_id:
-            inventory_query = supabase.table("view_inventory_list").select(
-                "product_id,batch,quantity,expiry_date,storage_location"
-            ).in_("product_id", product_ids).eq("branch_id", branch_id)
-            inventory = inventory_query.execute().data
-            
-            inv_by_product = {}
-            for inv in inventory:
-                prod_id = inv['product_id']
-                if prod_id not in inv_by_product:
-                    inv_by_product[prod_id] = []
-                inv_by_product[prod_id].append(inv)
-            
-            for product in products:
-                product['inventory'] = inv_by_product.get(product['id'], [])
-        else:
-            for product in products:
-                inventory_query = supabase.table("view_inventory_list").select(
-                    "branch_name,batch,quantity,expiry_date,storage_location"
-                ).eq("product_id", product['id'])
-                product['inventory'] = inventory_query.execute().data
-        
-        logger.debug(f"Product search completed", {"term": search_term, "results": len(products)})
-        return products
-        
-    except Exception as e:
-        logger.error("Product search failed", {"term": search_term, "error": str(e)})
-        return []
-
-def search_inventory(search_term, branch_id=None, limit=100):
-    """Search inventory by product SKU, name, or batch"""
-    search_term = search_term.strip()
-    if not search_term:
-        return []
-    
-    try:
-        query = supabase.table("view_inventory_list").select(
-            "id,branch_id,branch_name,product_id,product_name,sku,batch,quantity,expiry_date,storage_location,cost"
-        )
-        
-        if branch_id:
-            query = query.eq("branch_id", branch_id)
-        
-        query = query.or_(
-            f"sku.ilike.%{search_term}%,product_name.ilike.%{search_term}%,batch.ilike.%{search_term}%"
-        ).limit(limit)
-        
-        results = query.execute().data
-        logger.debug(f"Inventory search completed", {"term": search_term, "results": len(results)})
-        return results
-        
-    except Exception as e:
-        logger.error("Inventory search failed", {"term": search_term, "error": str(e)})
-        return []
-
 # ---------- DATA EXPORT ----------
 def export_data_to_csv(data: List[Dict], filename: str = "export.csv") -> bytes:
     """Export data to CSV and return as bytes"""
@@ -1180,7 +1228,7 @@ if page == "Dashboard":
     with col1:
         st.metric("Total Inventory Value", f"₦{total_val:,.0f}")
     with col2:
-        st.metric("Waste Risk (next 120d)", f"₦{waste_val:,.0f}")  # Updated to 120 days
+        st.metric("Waste Risk (next 120d)", f"₦{waste_val:,.0f}")
 
     alert_query = supabase.table("alert_log").select("alert_type, action_taken")
     if branch_id:
@@ -1200,47 +1248,71 @@ if page == "Dashboard":
         st.info("No alerts yet. Run daily maintenance function.")
 
 # ============================================================
-# PAGE: PRODUCTS & INVENTORY
+# PAGE: PRODUCTS & INVENTORY (OPTIMIZED)
 # ============================================================
 elif page == "Products & Inventory":
     st.header("📦 Products & Inventory Management")
     
     st.subheader("🔍 Search Products & Inventory")
+    
+    # Search settings in expander
+    with st.expander("⚙️ Search Settings", expanded=False):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            search_limit = st.slider("Max Results", min_value=10, max_value=200, value=50, key="search_limit")
+        with col2:
+            enable_cache = st.checkbox("Enable Search Cache", value=True, key="enable_cache")
+        with col3:
+            if st.button("🔄 Clear Search Cache"):
+                CacheManager.invalidate_all()
+                st.success("Cache cleared!")
+                st.rerun()
+    
     col1, col2 = st.columns([3, 1])
     with col1:
         search_term = st.text_input("Search by SKU, Product Name, or Batch", 
                                    placeholder="e.g., SKU123, Paracetamol, BATCH-001",
-                                   key="product_search")
+                                   key="product_search",
+                                   help="Minimum 2 characters for search")
     with col2:
         search_type = st.selectbox("Search in", ["Products", "Inventory"], key="search_type")
     
+    # Quick action buttons
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         if st.button("➕ Add Product", use_container_width=True):
             st.session_state.show_add_product = True
     with col2:
-        if st.button("📊 View All Products", use_container_width=True):
+        if st.button("📊 Products", use_container_width=True):
             st.session_state.show_all_products = True
             st.session_state.show_inventory = False
+            st.session_state.show_search_results = False
     with col3:
-        if st.button("📦 View All Inventory", use_container_width=True):
+        if st.button("📦 Inventory", use_container_width=True):
             st.session_state.show_inventory = True
             st.session_state.show_all_products = False
+            st.session_state.show_search_results = False
     with col4:
-        if st.button("🔄 Refresh Data", use_container_width=True):
+        if st.button("🔄 Refresh", use_container_width=True):
             CacheManager.invalidate_all()
             logger.info("Data refreshed")
             st.rerun()
     
     st.divider()
     
+    # Initialize session state
     if "show_add_product" not in st.session_state:
         st.session_state.show_add_product = False
     if "show_all_products" not in st.session_state:
         st.session_state.show_all_products = True
     if "show_inventory" not in st.session_state:
         st.session_state.show_inventory = False
+    if "show_search_results" not in st.session_state:
+        st.session_state.show_search_results = False
+    if "search_page" not in st.session_state:
+        st.session_state.search_page = 0
     
+    # Add Product Form
     if st.session_state.show_add_product:
         with st.expander("➕ Add New Product", expanded=True):
             with st.form("add_product_form"):
@@ -1284,14 +1356,43 @@ elif page == "Products & Inventory":
                         st.session_state.show_add_product = False
                         st.rerun()
     
-    if search_term:
+    # Search Results - OPTIMIZED SECTION
+    if search_term and len(search_term) >= 2:
+        st.session_state.show_search_results = True
+        st.session_state.show_all_products = False
+        st.session_state.show_inventory = False
+        
         if search_type == "Products":
             with st.spinner(f"Searching for '{search_term}'..."):
-                results = search_products(search_term, branch_id)
+                results = search_products(search_term, branch_id, search_limit)
             
             if results:
                 st.success(f"Found {len(results)} products matching '{search_term}'")
-                for product in results:
+                
+                # Summary statistics
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    total_products = len(results)
+                    st.metric("Products Found", total_products)
+                with col2:
+                    total_stock = sum(p.get('total_quantity', 0) for p in results)
+                    st.metric("Total Stock", total_stock)
+                with col3:
+                    categories = len(set(p.get('category', 'Uncategorized') for p in results))
+                    st.metric("Categories", categories)
+                
+                st.divider()
+                
+                # Display results with pagination
+                items_per_page = 10
+                total_items = len(results)
+                total_pages = (total_items + items_per_page - 1) // items_per_page
+                
+                start_idx = st.session_state.search_page * items_per_page
+                end_idx = min(start_idx + items_per_page, total_items)
+                page_results = results[start_idx:end_idx]
+                
+                for product in page_results:
                     with st.expander(f"📦 {product['name']} ({product['sku']})"):
                         col1, col2, col3 = st.columns(3)
                         with col1:
@@ -1299,55 +1400,93 @@ elif page == "Products & Inventory":
                             st.metric("Shelf Life", f"{product.get('shelf_life_days', 'N/A')} days")
                         with col2:
                             st.metric("Cost", f"₦{product.get('cost', 0):,.2f}")
-                            if product.get('inventory'):
-                                total_qty = sum(inv['quantity'] for inv in product['inventory'])
-                                st.metric("Total Stock", total_qty)
+                            if product.get('total_quantity', 0) > 0:
+                                st.metric("Total Stock", product.get('total_quantity', 0))
                         with col3:
-                            if st.button(f"✏️ Edit {product['sku']}", key=f"edit_{product['id']}"):
+                            if product.get('location_count', 0) > 0:
+                                st.metric("Locations", product.get('location_count', 0))
+                            if st.button(f"✏️ Edit", key=f"edit_{product['id']}"):
                                 st.session_state.edit_product = product
                         
                         if product.get('inventory'):
                             st.subheader("Inventory Locations")
                             inv_df = pd.DataFrame(product['inventory'])
-                            if 'branch_name' in inv_df.columns:
-                                display_cols = ['branch_name', 'batch', 'quantity', 'expiry_date', 'storage_location']
-                            else:
-                                display_cols = ['batch', 'quantity', 'expiry_date', 'storage_location']
-                            mobile_friendly_table(inv_df[display_cols])
+                            display_cols = ['branch_name', 'batch', 'quantity', 'expiry_date', 'storage_location']
+                            available_cols = [col for col in display_cols if col in inv_df.columns]
+                            mobile_friendly_table(inv_df[available_cols])
+                
+                # Pagination controls
+                if total_pages > 1:
+                    col1, col2, col3 = st.columns([1, 2, 1])
+                    with col1:
+                        if st.button("⬅️ Prev", disabled=st.session_state.search_page==0):
+                            st.session_state.search_page -= 1
+                            st.rerun()
+                    with col2:
+                        st.write(f"Page {st.session_state.search_page + 1} of {total_pages}")
+                    with col3:
+                        if st.button("Next ➡️", disabled=st.session_state.search_page>=total_pages-1):
+                            st.session_state.search_page += 1
+                            st.rerun()
             else:
                 st.info(f"No products found matching '{search_term}'")
+                if st.button("➕ Add this product?"):
+                    st.session_state.show_add_product = True
         
-        else:
+        else:  # Inventory search - OPTIMIZED
             with st.spinner(f"Searching inventory for '{search_term}'..."):
-                results = search_inventory(search_term, branch_id)
+                results, summary = search_inventory_optimized(search_term, branch_id, search_limit)
             
             if results:
-                st.success(f"Found {len(results)} inventory records matching '{search_term}'")
-                df_results = pd.DataFrame(results)
-                df_results['expiry_display'] = df_results['expiry_date'].apply(lambda x: x if pd.notna(x) else "No expiry")
-                mobile_friendly_table(df_results[['branch_name', 'product_name', 'sku', 'batch', 'quantity', 'expiry_display', 'storage_location']])
+                st.success(f"Found {summary['total_results']} inventory records matching '{search_term}'")
                 
-                st.subheader("⚡ Quick Inventory Adjustment")
-                selected_item = st.selectbox("Select inventory item to adjust", 
-                                           [f"{row['sku']} - {row['batch']}" for row in results])
-                if selected_item:
-                    selected_index = [f"{row['sku']} - {row['batch']}" == selected_item for row in results].index(True)
-                    selected_row = results[selected_index]
-                    new_qty = st.number_input("New Quantity", min_value=0, value=selected_row['quantity'])
-                    if st.button("Update Quantity"):
-                        try:
-                            supabase.table("inventory").update({"quantity": new_qty}).eq("id", selected_row['id']).execute()
-                            st.success("✅ Inventory updated!")
-                            logger.info(f"Inventory updated", {"id": selected_row['id'], "new_qty": new_qty})
-                            CacheManager.invalidate_all()
-                            st.rerun()
-                        except Exception as e:
-                            logger.error(f"Failed to update inventory", {"id": selected_row['id'], "error": str(e)})
-                            st.error(f"Failed to update: {e}")
+                # Summary statistics
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Records Found", summary['total_results'])
+                with col2:
+                    st.metric("Shown", summary['shown_results'])
+                with col3:
+                    st.metric("Total Quantity", f"{summary['total_quantity']:,}")
+                
+                st.divider()
+                
+                # Display results
+                df_results = pd.DataFrame(results)
+                if not df_results.empty:
+                    df_results['expiry_display'] = df_results['expiry_date'].apply(lambda x: x if pd.notna(x) else "No expiry")
+                    df_results['quantity_display'] = df_results['quantity'].apply(lambda x: f"{x:,}")
+                    
+                    mobile_friendly_table(df_results[['branch_name', 'product_name', 'sku', 'batch', 'quantity_display', 'expiry_display', 'storage_location']].rename(columns={
+                        'branch_name': 'Branch',
+                        'product_name': 'Product',
+                        'quantity_display': 'Quantity',
+                        'expiry_display': 'Expiry Date'
+                    }))
+                    
+                    st.subheader("⚡ Quick Inventory Adjustment")
+                    if len(results) > 0:
+                        selected_item = st.selectbox("Select inventory item to adjust", 
+                                                   [f"{row['sku']} - {row['batch']}" for row in results[:20]])
+                        if selected_item:
+                            selected_index = [f"{row['sku']} - {row['batch']}" == selected_item for row in results[:20]].index(True)
+                            selected_row = results[selected_index]
+                            new_qty = st.number_input("New Quantity", min_value=0, value=selected_row['quantity'])
+                            if st.button("Update Quantity"):
+                                try:
+                                    supabase.table("inventory").update({"quantity": new_qty}).eq("id", selected_row['id']).execute()
+                                    st.success("✅ Inventory updated!")
+                                    logger.info(f"Inventory updated", {"id": selected_row['id'], "new_qty": new_qty})
+                                    CacheManager.invalidate_all()
+                                    st.rerun()
+                                except Exception as e:
+                                    logger.error(f"Failed to update inventory", {"id": selected_row['id'], "error": str(e)})
+                                    st.error(f"Failed to update: {e}")
             else:
                 st.info(f"No inventory records found matching '{search_term}'")
     
     else:
+        # Show all products or inventory (not search)
         if st.session_state.show_inventory:
             st.subheader("📊 All Inventory")
             PAGE_SIZE = 50
@@ -1369,8 +1508,13 @@ elif page == "Products & Inventory":
             if inv_data:
                 df_i = pd.DataFrame(inv_data)
                 df_i['expiry_display'] = df_i['expiry_date'].apply(lambda x: x if pd.notna(x) else "No expiry")
-                mobile_friendly_table(df_i[['branch_name','product_name','sku','batch','quantity','expiry_display','storage_location']].rename(columns={
-                    'branch_name':'Branch','product_name':'Product','expiry_display':'Expiry Date'
+                df_i['quantity_display'] = df_i['quantity'].apply(lambda x: f"{x:,}")
+                
+                mobile_friendly_table(df_i[['branch_name','product_name','sku','batch','quantity_display','expiry_display','storage_location']].rename(columns={
+                    'branch_name':'Branch',
+                    'product_name':'Product',
+                    'quantity_display':'Quantity',
+                    'expiry_display':'Expiry Date'
                 }))
                 
                 col1, col2 = st.columns(2)
@@ -1398,7 +1542,10 @@ elif page == "Products & Inventory":
             
             if prods:
                 df_p = pd.DataFrame(prods)
-                mobile_friendly_table(df_p[['sku','name','category','shelf_life_days','cost']])
+                df_p['cost_display'] = df_p['cost'].apply(lambda x: f"₦{x:,.2f}")
+                mobile_friendly_table(df_p[['sku','name','category','shelf_life_days','cost_display']].rename(columns={
+                    'cost_display': 'Cost'
+                }))
                 
                 col1, col2 = st.columns(2)
                 if col1.button("⬅️ Prev", disabled=st.session_state.prod_page==0):
@@ -1684,7 +1831,8 @@ elif page == "Branches":
         
         for col in ['storekeeper_email','procurement_email','inventory_email','auditor_email','manager_email']:
             if col not in df.columns:
-                df[col] = None        
+                df[col] = None
+        
         if st.button("Upload Branches"):
             records = df[['name','code','storekeeper_email','procurement_email','inventory_email','auditor_email','manager_email']].to_dict(orient="records")
             success, err, count = upload_with_transaction("branches", records)
