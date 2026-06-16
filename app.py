@@ -11,9 +11,6 @@ import io
 import traceback
 from typing import Dict, List, Any, Optional, Tuple
 import time
-import os
-import secrets
-import string
 
 # ---------- CONFIG ----------
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
@@ -24,123 +21,6 @@ def get_supabase() -> Client:
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 supabase = get_supabase()
-
-# ---------- HTTPS ENFORCEMENT ----------
-def enforce_https():
-    """Enforce HTTPS in production"""
-    is_production = os.environ.get("STREAMLIT_ENV", "").lower() == "production"
-    
-    if is_production:
-        try:
-            if not st.session_state.get("_https_checked", False):
-                st.session_state._https_checked = True
-                logger.info("HTTPS enforcement active in production")
-                
-                st.markdown("""
-                <style>
-                .security-notice {
-                    background-color: #f0f8ff;
-                    padding: 10px;
-                    border-radius: 5px;
-                    border-left: 4px solid #0066cc;
-                    margin-bottom: 20px;
-                }
-                </style>
-                """, unsafe_allow_html=True)
-        except Exception as e:
-            logger.warning(f"Could not check HTTPS status: {e}")
-
-# ---------- RATE LIMITING ----------
-class RateLimiter:
-    """Simple rate limiter for login attempts and sensitive operations"""
-    
-    def __init__(self, max_attempts: int = 5, window_seconds: int = 300):
-        self.max_attempts = max_attempts
-        self.window_seconds = window_seconds
-        self.attempts = {}
-    
-    def is_allowed(self, key: str) -> bool:
-        """Check if a key is allowed to proceed"""
-        current_time = time.time()
-        
-        self.attempts = {
-            k: v for k, v in self.attempts.items()
-            if current_time - v['last_attempt'] < self.window_seconds
-        }
-        
-        if key not in self.attempts:
-            self.attempts[key] = {
-                'count': 1,
-                'last_attempt': current_time,
-                'blocked_until': None
-            }
-            return True
-        
-        if self.attempts[key].get('blocked_until') and current_time < self.attempts[key]['blocked_until']:
-            return False
-        
-        if self.attempts[key]['count'] >= self.max_attempts:
-            self.attempts[key]['blocked_until'] = current_time + self.window_seconds
-            return False
-        
-        self.attempts[key]['count'] += 1
-        self.attempts[key]['last_attempt'] = current_time
-        return True
-    
-    def reset(self, key: str):
-        """Reset attempts for a key"""
-        if key in self.attempts:
-            del self.attempts[key]
-
-# ---------- PASSWORD VALIDATION ----------
-class PasswordValidator:
-    """Enforce strong password policies"""
-    
-    MIN_LENGTH = 12
-    REQUIRE_UPPERCASE = True
-    REQUIRE_LOWERCASE = True
-    REQUIRE_DIGITS = True
-    REQUIRE_SPECIAL = True
-    SPECIAL_CHARS = "!@#$%^&*(),.?\":{}|<>"
-    
-    @classmethod
-    def validate(cls, password: str) -> Tuple[bool, str]:
-        """Validate password against policy"""
-        if not password or len(password) < cls.MIN_LENGTH:
-            return False, f"Password must be at least {cls.MIN_LENGTH} characters long."
-        
-        if cls.REQUIRE_UPPERCASE and not any(c.isupper() for c in password):
-            return False, "Password must contain at least one uppercase letter."
-        
-        if cls.REQUIRE_LOWERCASE and not any(c.islower() for c in password):
-            return False, "Password must contain at least one lowercase letter."
-        
-        if cls.REQUIRE_DIGITS and not any(c.isdigit() for c in password):
-            return False, "Password must contain at least one digit."
-        
-        if cls.REQUIRE_SPECIAL and not any(c in cls.SPECIAL_CHARS for c in password):
-            return False, f"Password must contain at least one special character: {cls.SPECIAL_CHARS}"
-        
-        common_patterns = [
-            "password", "123456", "qwerty", "admin", "letmein", 
-            "welcome", "monkey", "dragon", "master", "hello"
-        ]
-        if any(pattern in password.lower() for pattern in common_patterns):
-            return False, "Password contains common patterns and is too weak."
-        
-        if len(password) >= 3:
-            for i in range(len(password) - 2):
-                if password[i] == password[i+1] == password[i+2]:
-                    return False, "Password contains repeated characters (3 or more in a row)."
-        
-        return True, "Password is strong."
-    
-    @classmethod
-    def generate_strong_password(cls) -> str:
-        """Generate a strong password"""
-        alphabet = string.ascii_letters + string.digits + cls.SPECIAL_CHARS
-        password = ''.join(secrets.choice(alphabet) for _ in range(cls.MIN_LENGTH))
-        return password
 
 # ---------- STRUCTURED LOGGING ----------
 class StructuredLogger:
@@ -158,9 +38,8 @@ class StructuredLogger:
         self.app_name = app_name
         self.min_level = self.LOG_LEVELS.get(min_level, 20)
         self.logs = []
-        self.security_events = []
     
-    def _log(self, level: str, message: str, extra: Dict = None, security: bool = False):
+    def _log(self, level: str, message: str, extra: Dict = None):
         """Internal logging method"""
         if self.LOG_LEVELS.get(level, 0) < self.min_level:
             return
@@ -174,9 +53,7 @@ class StructuredLogger:
         }
         self.logs.append(log_entry)
         
-        if security:
-            self.security_events.append(log_entry)
-        
+        # Also print to console for debugging
         print(f"[{log_entry['timestamp']}] {level}: {message}")
         if extra:
             print(f"  Extra: {json.dumps(extra, default=str)}")
@@ -184,17 +61,17 @@ class StructuredLogger:
     def debug(self, message: str, extra: Dict = None):
         self._log("DEBUG", message, extra)
     
-    def info(self, message: str, extra: Dict = None, security: bool = False):
-        self._log("INFO", message, extra, security)
+    def info(self, message: str, extra: Dict = None):
+        self._log("INFO", message, extra)
     
-    def warning(self, message: str, extra: Dict = None, security: bool = False):
-        self._log("WARNING", message, extra, security)
+    def warning(self, message: str, extra: Dict = None):
+        self._log("WARNING", message, extra)
     
-    def error(self, message: str, extra: Dict = None, security: bool = False):
-        self._log("ERROR", message, extra, security)
+    def error(self, message: str, extra: Dict = None):
+        self._log("ERROR", message, extra)
     
-    def critical(self, message: str, extra: Dict = None, security: bool = False):
-        self._log("CRITICAL", message, extra, security)
+    def critical(self, message: str, extra: Dict = None):
+        self._log("CRITICAL", message, extra)
     
     def get_logs(self, level: str = None) -> List[Dict]:
         """Get logs filtered by level"""
@@ -202,19 +79,12 @@ class StructuredLogger:
             return [log for log in self.logs if log['level'] == level]
         return self.logs
     
-    def get_security_events(self) -> List[Dict]:
-        """Get security-related events"""
-        return self.security_events
-    
     def export_logs(self) -> str:
         """Export logs as JSON string"""
         return json.dumps(self.logs, indent=2, default=str)
 
 # Initialize logger
 logger = StructuredLogger(min_level="INFO")
-
-# Run HTTPS enforcement
-enforce_https()
 
 # ---------- CACHE MANAGEMENT ----------
 class CacheManager:
@@ -252,449 +122,33 @@ def cached_with_invalidation(ttl=300, key_prefix=""):
         return wrapped
     return decorator
 
-# Initialize rate limiter
-login_limiter = RateLimiter(max_attempts=5, window_seconds=300)
-api_limiter = RateLimiter(max_attempts=100, window_seconds=60)
-
-# ---------- GET REGISTERED EMAILS ----------
-@cached_with_invalidation(ttl=300, key_prefix="registered_emails")
-def get_registered_emails():
-    """Get all registered emails from branches with their roles"""
-    try:
-        # Get all branches with email fields
-        branches = supabase.table("branches").select(
-            "id, name, code, storekeeper_email, procurement_email, inventory_email, auditor_email, manager_email"
-        ).execute().data
-        
-        email_map = {}
-        
-        for branch in branches:
-            branch_name = branch.get('name', 'Unknown')
-            
-            # Check each email field
-            if branch.get('storekeeper_email'):
-                email = branch['storekeeper_email']
-                if email not in email_map:
-                    email_map[email] = {
-                        'email': email,
-                        'role': 'Storekeeper',
-                        'access': 'Viewer',
-                        'branches': []
-                    }
-                email_map[email]['branches'].append({
-                    'name': branch_name,
-                    'role': 'Storekeeper'
-                })
-            
-            if branch.get('procurement_email'):
-                email = branch['procurement_email']
-                if email not in email_map:
-                    email_map[email] = {
-                        'email': email,
-                        'role': 'Procurement',
-                        'access': 'Viewer',
-                        'branches': []
-                    }
-                email_map[email]['branches'].append({
-                    'name': branch_name,
-                    'role': 'Procurement'
-                })
-            
-            if branch.get('inventory_email'):
-                email = branch['inventory_email']
-                if email not in email_map:
-                    email_map[email] = {
-                        'email': email,
-                        'role': 'Inventory',
-                        'access': 'Viewer',
-                        'branches': []
-                    }
-                email_map[email]['branches'].append({
-                    'name': branch_name,
-                    'role': 'Inventory'
-                })
-            
-            if branch.get('auditor_email'):
-                email = branch['auditor_email']
-                if email not in email_map:
-                    email_map[email] = {
-                        'email': email,
-                        'role': 'Auditor',
-                        'access': 'Viewer',
-                        'branches': []
-                    }
-                email_map[email]['branches'].append({
-                    'name': branch_name,
-                    'role': 'Auditor'
-                })
-            
-            if branch.get('manager_email'):
-                email = branch['manager_email']
-                if email not in email_map:
-                    email_map[email] = {
-                        'email': email,
-                        'role': 'Manager',
-                        'access': 'Admin',
-                        'branches': []
-                    }
-                email_map[email]['branches'].append({
-                    'name': branch_name,
-                    'role': 'Manager'
-                })
-        
-        # Check for additional admin emails from secrets
-        admin_emails = st.secrets.get("ADMIN_EMAILS", "").split(",")
-        admin_emails = [e.strip() for e in admin_emails if e.strip()]
-        
-        for admin_email in admin_emails:
-            if admin_email in email_map:
-                email_map[admin_email]['access'] = 'Admin'
-                email_map[admin_email]['role'] = 'Admin (Additional)'
-            else:
-                # Admin email not in any branch
-                email_map[admin_email] = {
-                    'email': admin_email,
-                    'role': 'Admin (System)',
-                    'access': 'Admin',
-                    'branches': []
-                }
-        
-        return list(email_map.values())
-    
-    except Exception as e:
-        logger.error(f"Failed to get registered emails", {"error": str(e)})
-        return []
-
-# ---------- AUTH WITH EMAIL-BASED LOGIN ----------
+# ---------- AUTH ----------
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
     st.session_state.user_role = None
-    st.session_state.login_attempts = 0
-    st.session_state.last_login_attempt = None
-    st.session_state.user_email = None
-    st.session_state.user_branches = []
-    st.session_state.user_role_match = None
 
 if not st.session_state.authenticated:
-    # Check rate limiting for login
-    client_ip = st.query_params.get("client_ip", "unknown")
-    login_key = f"login_{client_ip}"
-    
-    if not login_limiter.is_allowed(login_key):
-        remaining_time = int(login_limiter.attempts.get(login_key, {}).get('blocked_until', time.time()) - time.time())
-        st.error(f"🔒 Too many failed login attempts. Please wait {remaining_time} seconds before trying again.")
-        logger.warning("Rate limit exceeded for login", {"client_ip": client_ip}, security=True)
-        st.stop()
-    
-    st.markdown("""
-    <style>
-    .login-container {
-        max-width: 400px;
-        margin: 0 auto;
-        padding: 20px;
-        background-color: #f8f9fa;
-        border-radius: 10px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-    }
-    .login-container h1 {
-        text-align: center;
-        margin-bottom: 20px;
-    }
-    .login-container .stTextInput {
-        margin-bottom: 15px;
-    }
-    .login-container .stButton {
-        margin-top: 10px;
-    }
-    .login-help {
-        font-size: 0.9em;
-        color: #666;
-        margin-top: 15px;
-        padding: 10px;
-        background-color: #fff3cd;
-        border-radius: 5px;
-        border-left: 4px solid #ffc107;
-    }
-    .registered-emails {
-        font-size: 0.85em;
-        margin-top: 10px;
-        padding: 10px;
-        background-color: #e8f5e9;
-        border-radius: 5px;
-        border-left: 4px solid #4caf50;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-    
-    st.markdown('<div class="login-container">', unsafe_allow_html=True)
-    
-    # Center the icon
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col2:
-        st.image("https://img.icons8.com/color/96/000000/inventory.png", width=80)
-    
-    st.title("🔐 Inventory Management System")
-    
-    st.markdown("---")
-    
-    # Option to view registered emails (admin only)
-    show_emails = st.checkbox("📋 Show registered emails (admin only)")
-    if show_emails:
-        admin_check = st.text_input("Enter admin password to view registered emails", type="password")
-        if admin_check == st.secrets.get("APP_PASSWORD", "changeme"):
-            registered_emails = get_registered_emails()
-            if registered_emails:
-                st.markdown('<div class="registered-emails">', unsafe_allow_html=True)
-                st.subheader("📧 Registered Emails")
-                
-                # Create a DataFrame for better display
-                df_emails = pd.DataFrame(registered_emails)
-                df_emails['branches'] = df_emails['branches'].apply(
-                    lambda x: ', '.join([f"{b['name']} ({b['role']})" for b in x]) if x else "No branch assigned"
-                )
-                st.dataframe(df_emails[['email', 'role', 'access', 'branches']])
-                
-                # Summary stats
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Total Users", len(registered_emails))
-                with col2:
-                    admin_count = len([e for e in registered_emails if e['access'] == 'Admin'])
-                    st.metric("Admins", admin_count)
-                with col3:
-                    viewer_count = len([e for e in registered_emails if e['access'] == 'Viewer'])
-                    st.metric("Viewers", viewer_count)
-                
-                st.markdown('</div>', unsafe_allow_html=True)
-            else:
-                st.info("No registered emails found.")
-        elif admin_check:
-            st.error("Incorrect admin password")
-    
-    st.markdown("---")
-    
-    # Regular login
-    email = st.text_input("📧 Email Address", placeholder="your.email@company.com", key="login_email")
-    pwd = st.text_input("🔑 Password", type="password", key="login_password")
-    
-    # Show password requirements info
-    with st.expander("📋 Password Information", expanded=False):
-        st.markdown("""
-        - **Admin users** (Managers) use the **Admin Password**
-        - **Viewer users** (Storekeepers, Procurement, Inventory, Auditors) use the **Viewer Password**
-        - Contact your system administrator if you don't have your password
-        """)
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        login_btn = st.button("🔓 Login", use_container_width=True)
-    with col2:
-        if st.button("❓ Help", use_container_width=True):
-            st.info("Use your registered email address and the system password provided by your administrator.")
-    
-    if login_btn:
-        if not email or not pwd:
-            st.error("Please enter both email and password.")
-        else:
-            # Check rate limiting again
-            if not login_limiter.is_allowed(login_key):
-                remaining_time = int(login_limiter.attempts.get(login_key, {}).get('blocked_until', time.time()) - time.time())
-                st.error(f"🔒 Too many failed login attempts. Please wait {remaining_time} seconds.")
-                st.stop()
-            
-            try:
-                # Check if the email exists in any branch
-                branch_query = supabase.table("branches").select(
-                    "id, name, code, storekeeper_email, procurement_email, inventory_email, auditor_email, manager_email"
-                ).or_(
-                    f"storekeeper_email.eq.{email},procurement_email.eq.{email},inventory_email.eq.{email},auditor_email.eq.{email},manager_email.eq.{email}"
-                )
-                
-                branch_result = branch_query.execute()
-                found_branches = branch_result.data
-                
-                if found_branches:
-                    # Email exists in at least one branch
-                    # Determine role based on which email field matched
-                    user_role = None
-                    matched_role = None
-                    
-                    for branch in found_branches:
-                        if branch.get('storekeeper_email') == email:
-                            matched_role = "storekeeper"
-                            user_role = "viewer"
-                            break
-                        elif branch.get('procurement_email') == email:
-                            matched_role = "procurement"
-                            user_role = "viewer"
-                            break
-                        elif branch.get('inventory_email') == email:
-                            matched_role = "inventory"
-                            user_role = "viewer"
-                            break
-                        elif branch.get('auditor_email') == email:
-                            matched_role = "auditor"
-                            user_role = "viewer"
-                            break
-                        elif branch.get('manager_email') == email:
-                            matched_role = "manager"
-                            user_role = "admin"
-                            break
-                    
-                    # Check if this is an admin email (can also use admin password)
-                    admin_emails = st.secrets.get("ADMIN_EMAILS", "").split(",")
-                    admin_emails = [e.strip() for e in admin_emails if e.strip()]
-                    is_admin = user_role == "admin" or email in admin_emails
-                    
-                    # Verify password based on role
-                    if is_admin:
-                        # Admin users can use APP_PASSWORD
-                        if pwd == st.secrets.get("APP_PASSWORD", "changeme"):
-                            st.session_state.authenticated = True
-                            st.session_state.user_role = "admin"
-                            st.session_state.user_email = email
-                            st.session_state.user_branches = found_branches
-                            st.session_state.user_role_match = matched_role or "admin"
-                            login_limiter.reset(login_key)
-                            
-                            logger.info(f"Admin user logged in successfully", {
-                                "email": email, 
-                                "role": matched_role, 
-                                "branch": found_branches[0]['name'] if found_branches else "N/A"
-                            }, security=True)
-                            st.rerun()
-                        else:
-                            # Admin but wrong password
-                            login_limiter.is_allowed(login_key)
-                            attempts_left = login_limiter.max_attempts - login_limiter.attempts.get(login_key, {}).get('count', 0)
-                            st.error(f"❌ Invalid admin password. {attempts_left} attempts remaining.")
-                            logger.warning(f"Failed admin login attempt", {"email": email, "attempts_left": attempts_left}, security=True)
-                    else:
-                        # Non-admin users use VIEWER_PASSWORD
-                        if pwd == st.secrets.get("VIEWER_PASSWORD", ""):
-                            st.session_state.authenticated = True
-                            st.session_state.user_role = "viewer"
-                            st.session_state.user_email = email
-                            st.session_state.user_branches = found_branches
-                            st.session_state.user_role_match = matched_role
-                            login_limiter.reset(login_key)
-                            
-                            logger.info(f"Viewer user logged in successfully", {
-                                "email": email, 
-                                "role": matched_role, 
-                                "branch": found_branches[0]['name'] if found_branches else "N/A"
-                            }, security=True)
-                            st.rerun()
-                        else:
-                            # Non-admin but wrong password
-                            login_limiter.is_allowed(login_key)
-                            attempts_left = login_limiter.max_attempts - login_limiter.attempts.get(login_key, {}).get('count', 0)
-                            st.error(f"❌ Invalid viewer password. {attempts_left} attempts remaining.")
-                            logger.warning(f"Failed viewer login attempt", {"email": email, "attempts_left": attempts_left}, security=True)
-                else:
-                    # Email not found in any branch
-                    login_limiter.is_allowed(login_key)
-                    attempts_left = login_limiter.max_attempts - login_limiter.attempts.get(login_key, {}).get('count', 0)
-                    st.error(f"❌ Email not registered in any branch. {attempts_left} attempts remaining.")
-                    logger.warning(f"Login attempt with unregistered email", {"email": email}, security=True)
-                    
-                    # Show help for debugging
-                    with st.expander("🔍 Need help? Check registered emails"):
-                        st.markdown("""
-                        **Your email must be added to a branch as one of:**
-                        - Storekeeper Email
-                        - Procurement Email  
-                        - Inventory Email
-                        - Auditor Email
-                        - Manager Email
-                        
-                        Contact your administrator to add your email to the appropriate branch.
-                        """)
-                        
-                        # Show registered emails (only if admin password is entered correctly)
-                        admin_check = st.text_input("Enter admin password to view registered emails", type="password", key="login_admin_check")
-                        if admin_check == st.secrets.get("APP_PASSWORD", "changeme"):
-                            registered_emails = get_registered_emails()
-                            if registered_emails:
-                                st.subheader("📧 Registered Emails")
-                                df_emails = pd.DataFrame(registered_emails)
-                                df_emails['branches'] = df_emails['branches'].apply(
-                                    lambda x: ', '.join([f"{b['name']} ({b['role']})" for b in x]) if x else "No branch assigned"
-                                )
-                                st.dataframe(df_emails[['email', 'role', 'access', 'branches']])
-                        elif admin_check:
-                            st.error("Incorrect admin password")
-                    
-            except Exception as e:
-                logger.error(f"Login error", {"error": str(e), "email": email}, security=True)
-                st.error(f"Login error: Please try again later.")
-    
-    # Show rate limit status
-    if login_key in login_limiter.attempts:
-        remaining = login_limiter.max_attempts - login_limiter.attempts[login_key]['count']
-        if remaining > 0 and remaining < login_limiter.max_attempts:
-            st.caption(f"🔒 {remaining} login attempts remaining")
-        elif remaining <= 0:
-            st.caption("🔒 Too many attempts. Please wait.")
-    
-    st.markdown("""
-    <div class="login-help">
-        💡 <strong>Login Help:</strong><br>
-        • Use your registered email address<br>
-        • Managers use the <strong>Admin Password</strong><br>
-        • All other roles use the <strong>Viewer Password</strong><br>
-        • Contact your administrator if you need access
-    </div>
-    """, unsafe_allow_html=True)
-    
-    st.markdown('</div>', unsafe_allow_html=True)
-    st.stop()
-
-# After authentication, show user info in sidebar
-if st.session_state.authenticated:
-    # Display user info in sidebar
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("👤 User Info")
-    st.sidebar.write(f"**Email:** {st.session_state.get('user_email', 'N/A')}")
-    st.sidebar.write(f"**Role:** {st.session_state.get('user_role', 'N/A').title()}")
-    if st.session_state.get('user_role_match'):
-        st.sidebar.write(f"**Branch Role:** {st.session_state.get('user_role_match', 'N/A').title()}")
-    
-    # Show branch access
-    if st.session_state.get('user_branches'):
-        branches = st.session_state.user_branches
-        st.sidebar.write("**Access to Branches:**")
-        for branch in branches:
-            st.sidebar.write(f"  • {branch['name']} ({branch['code']})")
-    
-    # Show registered emails (quick view for admins)
-    if st.session_state.user_role == "admin":
-        with st.sidebar.expander("📧 Registered Users", expanded=False):
-            registered = get_registered_emails()
-            if registered:
-                df = pd.DataFrame(registered)
-                st.dataframe(df[['email', 'role', 'access']], use_container_width=True)
-            else:
-                st.info("No registered users")
-    
-    # Logout button
-    if st.sidebar.button("🚪 Logout", use_container_width=True):
-        logger.info(f"User logged out", {"email": st.session_state.get('user_email')}, security=True)
-        for key in ['authenticated', 'user_role', 'user_email', 'user_branches', 'user_role_match']:
-            if key in st.session_state:
-                del st.session_state[key]
+    pwd = st.text_input("Enter access password", type="password")
+    if pwd == st.secrets.get("APP_PASSWORD", "changeme"):
+        st.session_state.authenticated = True
+        st.session_state.user_role = "admin"
+        logger.info("Admin user authenticated")
         st.rerun()
-    st.sidebar.markdown("---")
+    elif pwd == st.secrets.get("VIEWER_PASSWORD", ""):
+        st.session_state.authenticated = True
+        st.session_state.user_role = "viewer"
+        logger.info("Viewer user authenticated")
+        st.rerun()
+    elif pwd:
+        logger.warning("Failed login attempt")
+        st.error("Incorrect password")
+    st.stop()
 
 # ---------- EMAIL LINK AUTO-MARK ----------
 params = st.query_params
 if "alert_id" in params and "action" in params:
     alert_id = params["alert_id"]
     try:
-        if not api_limiter.is_allowed(f"api_{st.session_state.user_email}"):
-            st.error("🔒 Too many API requests. Please wait a moment.")
-            st.stop()
-        
         supabase.table("alert_log").update({
             "action_taken": "Marked done via email link",
             "action_date": datetime.now(timezone.utc).isoformat()
@@ -751,7 +205,7 @@ branch_id = None if selected_branch_name == "All Branches" else branch_maps['nam
 if st.session_state.user_role == "admin":
     pages = ["Dashboard", "Products & Inventory", "Branches", "CSV Upload", 
              "Alerts & Advisories", "Stock & Demand Limits", "Risk & FEFO", 
-             "Transfer Suggestions", "Registered Users", "System Logs", "Data Export", "Security Settings"]
+             "Transfer Suggestions", "System Logs", "Data Export"]
 else:
     pages = ["Dashboard", "Products & Inventory", "CSV Upload", 
              "Alerts & Advisories", "Stock & Demand Limits", "Risk & FEFO", 
@@ -760,6 +214,14 @@ else:
 page = st.sidebar.radio("Go to", pages)
 
 # ---------- RESPONSIVE DESIGN HELPERS ----------
+def responsive_columns(content_list, cols_per_row=2):
+    """Create responsive columns based on screen size"""
+    cols = st.columns(cols_per_row)
+    for idx, content in enumerate(content_list):
+        col_idx = idx % cols_per_row
+        with cols[col_idx]:
+            content()
+
 def mobile_friendly_table(df, max_height=400):
     """Display a mobile-friendly table with scrolling"""
     return st.dataframe(df, use_container_width=True, height=max_height)
@@ -808,6 +270,7 @@ class ProgressIndicator:
         else:
             self.status_text.text(f"✅ Complete! {self.total_steps} items processed in {time.time() - self.start_time:.1f}s")
         
+        # Keep progress bar at 100%
         if self.progress_bar:
             self.progress_bar.progress(1.0)
 
@@ -826,14 +289,23 @@ def validate_sku_format(sku):
         return False
     return bool(re.match(r'^[A-Za-z0-9_\-\.]+$', sku))
 
+def validate_expiry_date(expiry_date):
+    """Validate expiry date is in the future"""
+    if expiry_date is None:
+        return True
+    if isinstance(expiry_date, str):
+        try:
+            expiry_date = datetime.strptime(expiry_date, '%Y-%m-%d').date()
+        except:
+            return False
+    today = date.today()
+    return expiry_date >= today
+
 def upload_with_transaction(table_name, records, batch_size=500):
     """Upload with transaction-like behavior and progress tracking"""
     if not records:
         logger.info(f"No records to upload to {table_name}")
         return True, None, 0
-    
-    if not api_limiter.is_allowed(f"upload_{st.session_state.user_email}"):
-        return False, "🔒 Too many upload requests. Please wait a moment.", 0
     
     total_records = len(records)
     successful = 0
@@ -1117,58 +589,13 @@ def export_data_to_excel(data: List[Dict], filename: str = "export.xlsx") -> byt
         df.to_excel(writer, sheet_name='Data', index=False)
     return excel_buffer.getvalue()
 
-# ---------- SECURITY HEADERS ----------
-def add_security_headers():
-    """Add security headers and information to the page"""
-    st.markdown("""
-    <style>
-    .security-badge {
-        position: fixed;
-        bottom: 10px;
-        right: 10px;
-        background: rgba(0,0,0,0.7);
-        color: white;
-        padding: 5px 10px;
-        border-radius: 5px;
-        font-size: 12px;
-        z-index: 999;
-        font-family: monospace;
-    }
-    .security-badge .secure {
-        color: #00ff00;
-    }
-    .security-badge .insecure {
-        color: #ff0000;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-    
-    try:
-        is_production = os.environ.get("STREAMLIT_ENV", "").lower() == "production"
-        if is_production:
-            status = "🔒 Secure (HTTPS)"
-            color = "secure"
-        else:
-            status = "🔓 Development"
-            color = "insecure"
-        
-        st.markdown(f"""
-        <div class="security-badge">
-            <span class="{color}">{status}</span> | 
-            Rate Limit: {login_limiter.max_attempts} attempts
-        </div>
-        """, unsafe_allow_html=True)
-    except:
-        pass
-
-add_security_headers()
-
 # ============================================================
 # PAGE: DASHBOARD
 # ============================================================
 if page == "Dashboard":
     st.header("📊 Executive Summary")
     
+    # Responsive metrics
     col1, col2 = st.columns(2)
     
     if branch_id:
@@ -1204,11 +631,12 @@ if page == "Dashboard":
         st.info("No alerts yet. Run daily maintenance function.")
 
 # ============================================================
-# PAGE: PRODUCTS & INVENTORY
+# PAGE: PRODUCTS & INVENTORY (MERGED WITH SEARCH)
 # ============================================================
 elif page == "Products & Inventory":
     st.header("📦 Products & Inventory Management")
     
+    # Search and filter section
     st.subheader("🔍 Search Products & Inventory")
     col1, col2 = st.columns([3, 1])
     with col1:
@@ -1218,6 +646,7 @@ elif page == "Products & Inventory":
     with col2:
         search_type = st.selectbox("Search in", ["Products", "Inventory"], key="search_type")
     
+    # Action buttons for quick operations
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         if st.button("➕ Add Product", use_container_width=True):
@@ -1238,6 +667,7 @@ elif page == "Products & Inventory":
     
     st.divider()
     
+    # Initialize session state
     if "show_add_product" not in st.session_state:
         st.session_state.show_add_product = False
     if "show_all_products" not in st.session_state:
@@ -1245,6 +675,7 @@ elif page == "Products & Inventory":
     if "show_inventory" not in st.session_state:
         st.session_state.show_inventory = False
     
+    # Handle add product form
     if st.session_state.show_add_product:
         with st.expander("➕ Add New Product", expanded=True):
             with st.form("add_product_form"):
@@ -1288,6 +719,7 @@ elif page == "Products & Inventory":
                         st.session_state.show_add_product = False
                         st.rerun()
     
+    # Search results or default views
     if search_term:
         if search_type == "Products":
             with st.spinner(f"Searching for '{search_term}'..."):
@@ -1321,7 +753,7 @@ elif page == "Products & Inventory":
             else:
                 st.info(f"No products found matching '{search_term}'")
         
-        else:
+        else:  # Search inventory
             with st.spinner(f"Searching inventory for '{search_term}'..."):
                 results = search_inventory(search_term, branch_id)
             
@@ -1331,6 +763,7 @@ elif page == "Products & Inventory":
                 df_results['expiry_display'] = df_results['expiry_date'].apply(lambda x: x if pd.notna(x) else "No expiry")
                 mobile_friendly_table(df_results[['branch_name', 'product_name', 'sku', 'batch', 'quantity', 'expiry_display', 'storage_location']])
                 
+                # Quick action: Adjust inventory
                 st.subheader("⚡ Quick Inventory Adjustment")
                 selected_item = st.selectbox("Select inventory item to adjust", 
                                            [f"{row['sku']} - {row['batch']}" for row in results])
@@ -1352,6 +785,7 @@ elif page == "Products & Inventory":
                 st.info(f"No inventory records found matching '{search_term}'")
     
     else:
+        # Default view
         if st.session_state.show_inventory:
             st.subheader("📊 All Inventory")
             PAGE_SIZE = 50
@@ -1388,7 +822,7 @@ elif page == "Products & Inventory":
             else:
                 st.info("No inventory records found.")
         
-        else:
+        else:  # Show products
             st.subheader("📋 All Products")
             PAGE_SIZE = 50
             if "prod_page" not in st.session_state:
@@ -1413,6 +847,7 @@ elif page == "Products & Inventory":
                     st.rerun()
                 st.caption(f"Page {st.session_state.prod_page+1} of {total_pages}")
                 
+                # Edit product section
                 st.subheader("✏️ Edit Product")
                 edit_sku = st.selectbox("Select product to edit", [p['sku'] for p in prods])
                 if edit_sku:
@@ -1466,16 +901,11 @@ elif page == "Products & Inventory":
 elif page == "Branches":
     if st.session_state.user_role != "admin":
         st.error("Permission denied.")
-        logger.warning("Unauthorized access attempt to Branches page", security=True)
+        logger.warning("Unauthorized access attempt to Branches page")
         st.stop()
     
     st.header("🏢 Branch Management")
-    st.markdown("""
-    **Note:** Users can login using the email addresses listed in any branch.
-    - **Storekeeper, Procurement, Inventory, Auditor** → Viewer access (uses Viewer Password)
-    - **Manager** → Admin access (uses Admin Password)
-    """)
-    
+    st.markdown("Edit branch details below. No deletion is allowed.")
     branches = get_branches()
     
     if not branches:
@@ -1494,8 +924,6 @@ elif page == "Branches":
                         new_inventory = st.text_input("Inventory Email", value=branch.get('inventory_email', ''))
                         new_auditor = st.text_input("Auditor Email", value=branch.get('auditor_email', ''))
                         new_manager = st.text_input("Manager Email", value=branch.get('manager_email', ''))
-                    
-                    st.caption("💡 Users with these emails can login using the system password.")
                     
                     submitted = st.form_submit_button("💾 Save Changes")
                     if submitted:
@@ -1541,8 +969,6 @@ elif page == "Branches":
             inventory_email = st.text_input("Inventory Email")
             auditor_email = st.text_input("Auditor Email")
             manager_email = st.text_input("Manager Email")
-        
-        st.caption("💡 Users with these emails will be able to login with the system password.")
         
         submitted = st.form_submit_button("Add Branch")
         if submitted:
@@ -1601,126 +1027,6 @@ elif page == "Branches":
                 st.rerun()
             else:
                 st.error(err)
-
-# ============================================================
-# PAGE: REGISTERED USERS (admin only)
-# ============================================================
-elif page == "Registered Users":
-    if st.session_state.user_role != "admin":
-        st.error("Permission denied.")
-        logger.warning("Unauthorized access attempt to Registered Users page", security=True)
-        st.stop()
-    
-    st.header("📧 Registered Users")
-    st.markdown("View all registered emails and their associated roles and branches.")
-    
-    # Get registered emails
-    with st.spinner("Loading registered users..."):
-        registered_users = get_registered_emails()
-    
-    if registered_users:
-        # Summary statistics
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("Total Users", len(registered_users))
-        with col2:
-            admin_count = len([u for u in registered_users if u['access'] == 'Admin'])
-            st.metric("Admins", admin_count)
-        with col3:
-            viewer_count = len([u for u in registered_users if u['access'] == 'Viewer'])
-            st.metric("Viewers", viewer_count)
-        with col4:
-            # Count users with no branch assigned
-            no_branch = len([u for u in registered_users if not u['branches']])
-            st.metric("No Branch Assigned", no_branch)
-        
-        st.divider()
-        
-        # Detailed table view
-        st.subheader("📋 Detailed User List")
-        
-        # Prepare data for display
-        display_data = []
-        for user in registered_users:
-            branch_info = []
-            for branch in user['branches']:
-                branch_info.append(f"{branch['name']} ({branch['role']})")
-            
-            display_data.append({
-                "Email": user['email'],
-                "Role": user['role'],
-                "Access Level": user['access'],
-                "Branches": ", ".join(branch_info) if branch_info else "❌ No branch assigned"
-            })
-        
-        df_users = pd.DataFrame(display_data)
-        mobile_friendly_table(df_users)
-        
-        # Export functionality
-        st.subheader("📤 Export User List")
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("📥 Export as CSV"):
-                csv_data = export_data_to_csv(display_data, "registered_users")
-                st.download_button(
-                    label="Download CSV",
-                    data=csv_data,
-                    file_name=f"registered_users_{datetime.now().strftime('%Y%m%d')}.csv",
-                    mime="text/csv"
-                )
-        with col2:
-            if st.button("📥 Export as Excel"):
-                excel_data = export_data_to_excel(display_data, "registered_users")
-                st.download_button(
-                    label="Download Excel",
-                    data=excel_data,
-                    file_name=f"registered_users_{datetime.now().strftime('%Y%m%d')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-        
-        # Search functionality
-        st.subheader("🔍 Search Users")
-        search_term = st.text_input("Search by email or role", placeholder="e.g., manager, @company.com")
-        if search_term:
-            filtered = [u for u in display_data if search_term.lower() in u['Email'].lower() or search_term.lower() in u['Role'].lower()]
-            if filtered:
-                st.dataframe(pd.DataFrame(filtered), use_container_width=True)
-            else:
-                st.info("No users found matching your search.")
-        
-        # Show which users can login
-        st.subheader("🔑 Login Status")
-        st.info("""
-        **Users who can login:**
-        - All users with email addresses in branches can login
-        - Managers use the **Admin Password**
-        - Storekeepers, Procurement, Inventory, Auditors use the **Viewer Password**
-        - Additional admin emails can be added in `ADMIN_EMAILS` secret
-        """)
-        
-        # Quick action: Find user by email
-        st.subheader("🔎 Find User")
-        find_email = st.text_input("Enter email to find", placeholder="user@example.com")
-        if find_email:
-            found = [u for u in registered_users if u['email'].lower() == find_email.lower()]
-            if found:
-                st.success(f"✅ User found!")
-                st.json(found[0])
-            else:
-                st.error(f"❌ User with email '{find_email}' not found.")
-                st.info("Make sure the email is added to a branch as one of the email fields.")
-    
-    else:
-        st.warning("No registered users found.")
-        st.markdown("""
-        ### How to register users:
-        1. Go to the **Branches** page
-        2. Add or edit a branch
-        3. Fill in the email fields (Storekeeper, Procurement, Inventory, Auditor, Manager)
-        4. Users with these emails will be able to login
-        
-        **Note:** Managers get Admin access, all others get Viewer access.
-        """)
 
 # ============================================================
 # PAGE: CSV UPLOAD
@@ -1841,7 +1147,7 @@ elif page == "CSV Upload":
                 else:
                     st.error(err)
         
-        else:
+        else:  # movements
             required_cols = {'product_sku','quantity_change','movement_date'}
             is_valid, msg = validate_csv_columns(df, required_cols, "movements CSV")
             if not is_valid:
@@ -2186,35 +1492,33 @@ elif page == "Transfer Suggestions":
 elif page == "System Logs":
     if st.session_state.user_role != "admin":
         st.error("Permission denied.")
-        logger.warning("Unauthorized access attempt to System Logs page", security=True)
+        logger.warning("Unauthorized access attempt to System Logs page")
         st.stop()
     
     st.header("📋 System Logs")
     st.markdown("View structured system logs for debugging and monitoring.")
     
-    col1, col2, col3 = st.columns(3)
+    # Log filters
+    col1, col2 = st.columns(2)
     with col1:
         log_level = st.selectbox("Filter by level", ["ALL", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
     with col2:
-        log_type = st.selectbox("Log type", ["All Logs", "Security Events Only"])
-    with col3:
         max_logs = st.number_input("Max logs to display", min_value=10, max_value=1000, value=100)
     
-    if log_type == "Security Events Only":
-        logs = logger.get_security_events()
-    else:
-        logs = logger.get_logs()
-    
+    # Get logs
+    logs = logger.get_logs()
     if log_level != "ALL":
         logs = [log for log in logs if log['level'] == log_level]
     
     logs = logs[-max_logs:]
     
     if logs:
+        # Display logs in a table
         df_logs = pd.DataFrame(logs)
         df_logs['timestamp'] = pd.to_datetime(df_logs['timestamp'])
         mobile_friendly_table(df_logs[['timestamp', 'level', 'message', 'extra']])
         
+        # Export logs
         st.subheader("📤 Export Logs")
         col1, col2 = st.columns(2)
         with col1:
@@ -2248,17 +1552,12 @@ elif page == "Data Export":
         "Stock Limits",
         "Risk Scores",
         "Alert Log",
-        "Transfer Suggestions",
-        "Registered Users"
+        "Transfer Suggestions"
     ])
     
     format_type = st.selectbox("Export format", ["CSV", "Excel"])
     
     if st.button("Generate Export"):
-        if not api_limiter.is_allowed(f"export_{st.session_state.user_email}"):
-            st.error("🔒 Too many export requests. Please wait a moment.")
-            st.stop()
-        
         with st.spinner(f"Generating {export_type} export..."):
             try:
                 data = []
@@ -2302,22 +1601,6 @@ elif page == "Data Export":
                     data = query.execute().data
                     filename = f"transfer_suggestions_{datetime.now().strftime('%Y%m%d')}"
                 
-                elif export_type == "Registered Users":
-                    registered_users = get_registered_emails()
-                    data = []
-                    for user in registered_users:
-                        branch_info = []
-                        for branch in user['branches']:
-                            branch_info.append(f"{branch['name']} ({branch['role']})")
-                        
-                        data.append({
-                            "Email": user['email'],
-                            "Role": user['role'],
-                            "Access Level": user['access'],
-                            "Branches": ", ".join(branch_info) if branch_info else "No branch assigned"
-                        })
-                    filename = f"registered_users_{datetime.now().strftime('%Y%m%d')}"
-                
                 if data:
                     if format_type == "CSV":
                         export_data = export_data_to_csv(data, filename)
@@ -2327,7 +1610,7 @@ elif page == "Data Export":
                             file_name=f"{filename}.csv",
                             mime="text/csv"
                         )
-                    else:
+                    else:  # Excel
                         export_data = export_data_to_excel(data, filename)
                         st.download_button(
                             label=f"📥 Download {filename}.xlsx",
@@ -2344,95 +1627,3 @@ elif page == "Data Export":
             except Exception as e:
                 logger.error(f"Export failed", {"type": export_type, "error": str(e)})
                 st.error(f"Export failed: {str(e)}")
-
-# ============================================================
-# PAGE: SECURITY SETTINGS (admin only)
-# ============================================================
-elif page == "Security Settings":
-    if st.session_state.user_role != "admin":
-        st.error("Permission denied.")
-        logger.warning("Unauthorized access attempt to Security Settings page", security=True)
-        st.stop()
-    
-    st.header("🔒 Security Settings")
-    st.markdown("Manage security policies and view security status.")
-    
-    st.subheader("📊 Security Status")
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        is_production = os.environ.get("STREAMLIT_ENV", "").lower() == "production"
-        if is_production:
-            st.success("✅ HTTPS Enabled (Production)")
-        else:
-            st.warning("⚠️ Development Mode (HTTPS not enforced)")
-    
-    with col2:
-        st.metric("Rate Limit", f"{login_limiter.max_attempts} attempts")
-    
-    with col3:
-        st.metric("Min Password Length", f"{PasswordValidator.MIN_LENGTH} chars")
-    
-    st.subheader("⚙️ Rate Limiting Configuration")
-    col1, col2 = st.columns(2)
-    with col1:
-        new_max_attempts = st.number_input("Max Login Attempts", min_value=3, max_value=10, value=login_limiter.max_attempts)
-    with col2:
-        new_window = st.number_input("Rate Limit Window (seconds)", min_value=60, max_value=3600, value=300)
-    
-    if st.button("Update Rate Limits"):
-        login_limiter.max_attempts = new_max_attempts
-        login_limiter.window_seconds = new_window
-        logger.info(f"Rate limits updated", {"max_attempts": new_max_attempts, "window": new_window}, security=True)
-        st.success("✅ Rate limits updated successfully!")
-        st.rerun()
-    
-    st.subheader("🔐 Password Policy Configuration")
-    col1, col2 = st.columns(2)
-    with col1:
-        min_length = st.number_input("Minimum Password Length", min_value=8, max_value=20, value=PasswordValidator.MIN_LENGTH)
-        require_upper = st.checkbox("Require Uppercase", value=PasswordValidator.REQUIRE_UPPERCASE)
-        require_lower = st.checkbox("Require Lowercase", value=PasswordValidator.REQUIRE_LOWERCASE)
-    with col2:
-        require_digits = st.checkbox("Require Digits", value=PasswordValidator.REQUIRE_DIGITS)
-        require_special = st.checkbox("Require Special Characters", value=PasswordValidator.REQUIRE_SPECIAL)
-    
-    if st.button("Update Password Policy"):
-        PasswordValidator.MIN_LENGTH = min_length
-        PasswordValidator.REQUIRE_UPPERCASE = require_upper
-        PasswordValidator.REQUIRE_LOWERCASE = require_lower
-        PasswordValidator.REQUIRE_DIGITS = require_digits
-        PasswordValidator.REQUIRE_SPECIAL = require_special
-        logger.info("Password policy updated", {"min_length": min_length}, security=True)
-        st.success("✅ Password policy updated successfully!")
-        st.rerun()
-    
-    st.subheader("🛡️ Recent Security Events")
-    security_events = logger.get_security_events()[-20:]
-    if security_events:
-        df_events = pd.DataFrame(security_events)
-        df_events['timestamp'] = pd.to_datetime(df_events['timestamp'])
-        mobile_friendly_table(df_events[['timestamp', 'level', 'message']])
-    else:
-        st.info("No security events logged.")
-    
-    with st.expander("📋 Security Best Practices Checklist", expanded=False):
-        st.markdown("""
-        ✅ **Password Policy:** At least 12 characters with mixed case, digits, and special characters
-        ✅ **Rate Limiting:** 5 attempts per 5 minutes
-        ✅ **HTTPS Enforcement:** HTTPS required in production
-        ✅ **Email-based Authentication:** Users login with email from branches
-        ✅ **Role-based Access:** Managers = Admin, Others = Viewer
-        ✅ **Audit Logging:** All security events logged
-        ✅ **Input Validation:** SKU validation, expiry date validation
-        ✅ **Error Handling:** No sensitive information in error messages
-        ✅ **Data Protection:** Secure data storage in Supabase
-        ✅ **User Management:** View all registered users with roles
-        
-        **Recommendations:**
-        - Regularly review security logs
-        - Enforce password rotation every 90 days
-        - Enable 2FA for admin accounts (future enhancement)
-        - Regular security audits
-        - Monitor failed login attempts
-        """)
