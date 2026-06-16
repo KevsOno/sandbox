@@ -719,9 +719,18 @@ def get_branch_maps():
         'id_to_code': {b['id']: b['code'] for b in branches}
     }
 
+# Get branches data with error handling
 branches_data = get_branches()
 branch_maps = get_branch_maps()
-branch_names = [b['name'] for b in branches_data]
+
+# Safely get branch names
+branch_names = []
+if branches_data:
+    branch_names = [b['name'] for b in branches_data]
+
+# Ensure branch_maps has the expected keys
+if 'name_to_id' not in branch_maps:
+    branch_maps['name_to_id'] = {}
 
 def reset_pagination():
     st.session_state.prod_page = 0
@@ -730,12 +739,22 @@ def reset_pagination():
     st.session_state.limits_page = 0
     st.session_state.risk_page = 0
 
+# Safely get branch_id
 selected_branch_name = st.sidebar.selectbox(
     "Select Branch",
     ["All Branches"] + branch_names,
     on_change=reset_pagination
 )
-branch_id = None if selected_branch_name == "All Branches" else branch_maps['name_to_id'].get(selected_branch_name)
+
+# Safely get branch_id with error handling
+try:
+    if selected_branch_name == "All Branches":
+        branch_id = None
+    else:
+        branch_id = branch_maps.get('name_to_id', {}).get(selected_branch_name)
+except Exception as e:
+    logger.error(f"Error getting branch ID", {"error": str(e), "selected_branch": selected_branch_name})
+    branch_id = None
 
 # ---------- NAVIGATION ----------
 if st.session_state.user_role == "admin":
