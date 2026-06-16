@@ -719,18 +719,9 @@ def get_branch_maps():
         'id_to_code': {b['id']: b['code'] for b in branches}
     }
 
-# Get branches data with error handling
 branches_data = get_branches()
 branch_maps = get_branch_maps()
-
-# Safely get branch names
-branch_names = []
-if branches_data:
-    branch_names = [b['name'] for b in branches_data]
-
-# Ensure branch_maps has the expected keys
-if 'name_to_id' not in branch_maps:
-    branch_maps['name_to_id'] = {}
+branch_names = [b['name'] for b in branches_data]
 
 def reset_pagination():
     st.session_state.prod_page = 0
@@ -739,22 +730,12 @@ def reset_pagination():
     st.session_state.limits_page = 0
     st.session_state.risk_page = 0
 
-# Safely get branch_id
 selected_branch_name = st.sidebar.selectbox(
     "Select Branch",
     ["All Branches"] + branch_names,
     on_change=reset_pagination
 )
-
-# Safely get branch_id with error handling
-try:
-    if selected_branch_name == "All Branches":
-        branch_id = None
-    else:
-        branch_id = branch_maps.get('name_to_id', {}).get(selected_branch_name)
-except Exception as e:
-    logger.error(f"Error getting branch ID", {"error": str(e), "selected_branch": selected_branch_name})
-    branch_id = None
+branch_id = None if selected_branch_name == "All Branches" else branch_maps['name_to_id'].get(selected_branch_name)
 
 # ---------- NAVIGATION ----------
 if st.session_state.user_role == "admin":
@@ -983,7 +964,7 @@ def chunked_sku_lookup(skus, chunk_size=200):
             sku_to_id[p['sku']] = p['id']
     return sku_to_id
 
-def ensure_products_exist(skus, default_cost=0.0, default_shelf_life=120):
+def ensure_products_exist(skus, default_cost=0.0, default_shelf_life=90):
     """Ensure products exist, with better error handling and validation"""
     if not skus:
         return {}
@@ -1193,7 +1174,7 @@ if page == "Dashboard":
     with col1:
         st.metric("Total Inventory Value", f"₦{total_val:,.0f}")
     with col2:
-        st.metric("Waste Risk (next 120d)", f"₦{waste_val:,.0f}")  # Updated to 120 days
+        st.metric("Waste Risk (next 90d)", f"₦{waste_val:,.0f}")
 
     alert_query = supabase.table("alert_log").select("alert_type, action_taken")
     if branch_id:
@@ -1263,7 +1244,7 @@ elif page == "Products & Inventory":
                     new_name = st.text_input("Product Name*")
                 with col2:
                     new_category = st.text_input("Category")
-                    new_shelf_life = st.number_input("Shelf Life (days)", min_value=1, value=120)
+                    new_shelf_life = st.number_input("Shelf Life (days)", min_value=1, value=90)
                     new_cost = st.number_input("Unit Cost (₦)", min_value=0.0, value=0.0, format="%.2f")
                 
                 col1, col2 = st.columns(2)
@@ -1991,11 +1972,10 @@ elif page == "CSV Upload":
 elif page == "Alerts & Advisories":
     st.header("🚨 Alerts & Advisories")
     st.markdown("""
-    **Alert Thresholds (Updated):**
-    - 🔴 **CRITICAL:** Expiry ≤ 120 days (4 months) - Immediate action required
-    - 🟠 **HIGH:** Expiry 121-180 days (6 months) - Plan for consumption or transfer
-    - 🟡 **MEDIUM:** Expiry 181-270 days (9 months) - Monitor closely
-    - 🟢 **LOW:** Expiry > 270 days (9+ months) - Normal inventory
+    **Alert Thresholds:**
+    - 🔴 **CRITICAL:** Expiry ≤ 90 days (3 months) - Immediate action required
+    - 🟠 **HIGH:** Expiry 91-120 days (4 months) - Plan for consumption or transfer
+    - 🟡 **MEDIUM:** Expiry 121-180 days (6 months) - Monitor closely
     """)
     
     PAGE_SIZE = 50
@@ -2094,10 +2074,10 @@ elif page == "Risk & FEFO":
     st.header("⚠️ Risk Scoring & FEFO Recommendations")
     st.markdown("""
     **FEFO** = *First Expired, First Out* – we recommend consuming batches with the earliest expiry date first.  
-    **Risk Score** combines expiry proximity (with 120-day write‑off threshold), financial exposure, and sales velocity.  
+    **Risk Score** combines expiry proximity (with 90-day write‑off threshold), financial exposure, and sales velocity.  
     **Risk Levels:** LOW 🟢 → MODERATE 🟡 → HIGH 🟠 → CRITICAL 🔴
     
-    **Critical Threshold:** Products with **≤120 days (4 months)** to expiry are considered high risk and require immediate attention.
+    **Critical Threshold:** Products with **≤90 days (3 months)** to expiry are considered high risk and require immediate attention.
     """)
     
     PAGE_SIZE = 100
@@ -2141,11 +2121,11 @@ elif page == "Risk & FEFO":
     def get_risk_color(row):
         if row['days_to_expiry'] is None or pd.isna(row['days_to_expiry']):
             return "🟢"
-        if row['days_to_expiry'] <= 120:
+        if row['days_to_expiry'] <= 90:
             return "🔴"
-        elif row['days_to_expiry'] <= 180:
+        elif row['days_to_expiry'] <= 120:
             return "🟠"
-        elif row['days_to_expiry'] <= 270:
+        elif row['days_to_expiry'] <= 180:
             return "🟡"
         else:
             return "🟢"
@@ -2175,11 +2155,11 @@ elif page == "Risk & FEFO":
     for idx, row in fefo_order.iterrows():
         if pd.notna(row['expiry_date']):
             days_left = row['days_to_expiry']
-            if days_left <= 120:
+            if days_left <= 90:
                 urgency = "🔴 CRITICAL - Consume immediately!"
-            elif days_left <= 180:
+            elif days_left <= 120:
                 urgency = "🟠 HIGH - Prioritize consumption"
-            elif days_left <= 270:
+            elif days_left <= 180:
                 urgency = "🟡 MODERATE - Plan consumption"
             else:
                 urgency = "🟢 LOW - Normal rotation"
@@ -2189,30 +2169,30 @@ elif page == "Risk & FEFO":
     risk_counts = df_risk['risk_level'].value_counts()
     st.bar_chart(risk_counts)
     
-    critical_items = df_risk[df_risk['days_to_expiry'] <= 120]
+    critical_items = df_risk[df_risk['days_to_expiry'] <= 90]
     if not critical_items.empty:
-        st.warning(f"⚠️ **{len(critical_items)}** batches have ≤120 days to expiry and require immediate attention!")
+        st.warning(f"⚠️ **{len(critical_items)}** batches have ≤90 days to expiry and require immediate attention!")
         mobile_friendly_table(critical_items[['product_name', 'sku', 'batch', 'quantity', 'days_to_expiry']].head(10))
     
     with st.expander("ℹ️ How risk score is calculated"):
         st.markdown("""
         **Risk Score = (Expiry Score × 0.5) + (Financial Score × 0.3) + (Low Velocity Score × 0.2)**  
         - **Expiry Score** (0–100): 
-          - ≤120 days → 100 (CRITICAL - 4 months or less)
-          - 121-180 days → 90 (HIGH - 6 months)
-          - 181-270 days → 75 (MODERATE - 9 months)
-          - 271-365 days → 40 (LOW - 1 year)
+          - ≤90 days → 100 (CRITICAL - 3 months or less)
+          - 91-120 days → 90 (HIGH - 4 months)
+          - 121-180 days → 75 (MODERATE - 6 months)
+          - 181-365 days → 40 (LOW - 1 year)
           - >365 days → 10 (VERY LOW - over 1 year)
         - **Financial Score** (0–100): normalised quantity × cost  
         - **Low Velocity Score** (0–100): ≤0.1 units/day→90, 0.11–0.5→70, 0.51–2→40, >2→10  
         
         **Risk levels:** 
-        - CRITICAL (≥80) → Products with ≤120 days to expiry
-        - HIGH (60–79) → Products with 121-180 days to expiry
-        - MODERATE (35–59) → Products with 181-270 days to expiry
-        - LOW (<35) → Products with >270 days to expiry
+        - CRITICAL (≥80) → Products with ≤90 days to expiry
+        - HIGH (60–79) → Products with 91-120 days to expiry
+        - MODERATE (35–59) → Products with 121-180 days to expiry
+        - LOW (<35) → Products with >180 days to expiry
         
-        ⚠️ **Real‑world note:** Products with **≤120 days (4 months)** to expiry are considered write‑off risks and trigger immediate alerts.
+        ⚠️ **Real‑world note:** Products with **≤90 days (3 months)** to expiry are considered write‑off risks and trigger immediate alerts.
         """)
 
 # ============================================================
@@ -2224,10 +2204,10 @@ elif page == "Transfer Suggestions":
     **Optimised suggestions** – computed entirely inside the database.
     - **Stock imbalance:** Branch has excess stock; another branch needs it (expiry‑agnostic).
     - **Expiry risk:** Batch expiring soon in a slow‑selling branch → transfer to a branch with higher demand.
-    - **Urgency (Updated for 120-day threshold):**  
-      - **CRITICAL** – Expiry ≤120 days (4 months) **or** deficit very high (urgent transfer needed)  
-      - **HIGH** – Expiry 121-180 days (6 months)  
-      - **MEDIUM** – Expiry 181-270 days (9 months)
+    - **Urgency (Updated for 90-day threshold):**  
+      - **CRITICAL** – Expiry ≤90 days (3 months) **or** deficit very high (urgent transfer needed)  
+      - **HIGH** – Expiry 91-120 days (4 months)  
+      - **MEDIUM** – Expiry 121-180 days (6 months)
     """)
     
     try:
@@ -2279,11 +2259,11 @@ elif page == "Transfer Suggestions":
     with st.expander("ℹ️ How suggestions are generated"):
         st.markdown("""
         - **Stock imbalance transfer (surplus → deficit):** Branch has more than reorder point + safety stock + 5 units; another branch is below reorder point. Applies to all products (including non‑expiring).
-        - **Expiry risk transfer:** Batch expiring ≤120 days (4 months) in a branch with very low demand (<0.5 units/day) → transfer to branch with higher demand.
+        - **Expiry risk transfer:** Batch expiring ≤90 days (3 months) in a branch with very low demand (<0.5 units/day) → transfer to branch with higher demand.
         - **Urgency (Updated thresholds):** 
-          - CRITICAL (expiry ≤120 days or deficit very high)
-          - HIGH (expiry 121-180 days)
-          - MEDIUM (expiry 181-270 days)
+          - CRITICAL (expiry ≤90 days or deficit very high)
+          - HIGH (expiry 91-120 days)
+          - MEDIUM (expiry 121-180 days)
         - All calculations run inside PostgreSQL using indexed joins – no client‑side processing.
         """)
 
