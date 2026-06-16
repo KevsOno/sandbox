@@ -697,31 +697,68 @@ if "alert_id" in params and "action" in params:
         logger.error(f"Failed to mark alert {alert_id} as done", {"error": str(e)})
         st.error(f"Failed to mark alert: {str(e)}")
 
-# ---------- BRANCH SELECTOR ----------
-@cached_with_invalidation(ttl=3600, key_prefix="branches")
+# ---------- BRANCH SELECTOR WITH RETRY LOGIC ----------
+@cached_with_invalidation(ttl=60, key_prefix="branches")
 def get_branches():
-    """Get branches with efficient single query"""
-    try:
-        data = supabase.table("branches").select("id,name,code").execute().data
-        logger.debug("Branches fetched successfully", {"count": len(data)})
-        return data
-    except Exception as e:
-        logger.error("Failed to fetch branches", {"error": str(e)})
-        return []
+    """Get branches with efficient single query and retry logic"""
+    max_retries = 3
+    retry_delay = 1  # seconds
+    
+    for attempt in range(max_retries):
+        try:
+            data = supabase.table("branches").select("id,name,code").execute().data
+            if data is not None:
+                logger.debug("Branches fetched successfully", {"count": len(data)})
+                return data
+            else:
+                logger.warning(f"No branch data received (attempt {attempt+1}/{max_retries})")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    continue
+        except Exception as e:
+            logger.error(f"Failed to fetch branches (attempt {attempt+1}/{max_retries})", {"error": str(e)})
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+                continue
+    
+    # Return empty list on final failure
+    logger.error("Failed to fetch branches after all retries")
+    return []
 
-@cached_with_invalidation(ttl=3600, key_prefix="branch_maps")
+@cached_with_invalidation(ttl=60, key_prefix="branch_maps")
 def get_branch_maps():
-    """Pre-compute branch lookup maps to avoid repeated lookups"""
-    branches = get_branches()
-    return {
-        'id_to_name': {b['id']: b['name'] for b in branches},
-        'name_to_id': {b['name']: b['id'] for b in branches},
-        'id_to_code': {b['id']: b['code'] for b in branches}
-    }
+    """Pre-compute branch lookup maps with retry logic"""
+    max_retries = 3
+    retry_delay = 1  # seconds
+    
+    for attempt in range(max_retries):
+        try:
+            branches = get_branches()
+            if branches and len(branches) > 0:
+                return {
+                    'id_to_name': {b['id']: b['name'] for b in branches},
+                    'name_to_id': {b['name']: b['id'] for b in branches},
+                    'id_to_code': {b['id']: b['code'] for b in branches}
+                }
+            else:
+                logger.warning(f"No branches found for maps (attempt {attempt+1}/{max_retries})")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    continue
+        except Exception as e:
+            logger.error(f"Failed to get branch maps (attempt {attempt+1}/{max_retries})", {"error": str(e)})
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+                continue
+    
+    # Return empty maps on final failure
+    logger.error("Failed to get branch maps after all retries")
+    return {'id_to_name': {}, 'name_to_id': {}, 'id_to_code': {}}
 
+# Load branch data with retry
 branches_data = get_branches()
 branch_maps = get_branch_maps()
-branch_names = [b['name'] for b in branches_data]
+branch_names = [b['name'] for b in branches_data] if branches_data else []
 
 def reset_pagination():
     st.session_state.prod_page = 0
@@ -732,7 +769,7 @@ def reset_pagination():
     st.session_state.search_page = 0
 
 # FIX: Safely handle branch selection with proper error handling
-if branch_maps and 'name_to_id' in branch_maps:
+if branch_maps and 'name_to_id' in branch_maps and branch_maps['name_to_id']:
     selected_branch_name = st.sidebar.selectbox(
         "Select Branch",
         ["All Branches"] + branch_names,
@@ -740,7 +777,11 @@ if branch_maps and 'name_to_id' in branch_maps:
     )
     branch_id = None if selected_branch_name == "All Branches" else branch_maps['name_to_id'].get(selected_branch_name)
 else:
-    st.error("⚠️ Unable to load branch data. Please check your database connection.")
+    # Only show warning if we have no branches at all
+    if not branch_names:
+        st.sidebar.warning("⚠️ No branches found. Please add branches in the Branches page.")
+    else:
+        st.sidebar.info("🔄 Loading branch data...")
     selected_branch_name = "All Branches"
     branch_id = None
 
