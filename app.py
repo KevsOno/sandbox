@@ -840,7 +840,8 @@ elif page == "Products & Inventory":
                 
                 col1, col2 = st.columns(2)
                 if col1.button("⬅️ Prev", disabled=st.session_state.prod_page==0):
-                    st.session_state.prod_page -= 1                    st.rerun()
+                    st.session_state.prod_page -= 1
+                    st.rerun()
                 if col2.button("Next ➡️", disabled=st.session_state.prod_page>=total_pages-1):
                     st.session_state.prod_page += 1
                     st.rerun()
