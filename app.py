@@ -156,12 +156,11 @@ def check_password():
         """Checks whether a password entered by the user is correct."""
         if st.session_state["password"] == st.secrets["APP_PASSWORD"]:
             st.session_state["password_correct"] = True
-            del st.session_state["password"]  # Don't store the password.
+            del st.session_state["password"]
         else:
             st.session_state["password_correct"] = False
 
     if "password_correct" not in st.session_state:
-        # First run, show input for password.
         st.markdown("""
         <style>
         .login-container {
@@ -185,7 +184,6 @@ def check_password():
         st.title("🔐 Inventory Management System")
         st.markdown("---")
         
-        # Password input
         st.text_input(
             "Enter password to continue",
             type="password",
@@ -200,7 +198,6 @@ def check_password():
         return False
 
     if not st.session_state.get("password_correct", False):
-        # Password not correct, show input + error.
         st.markdown("""
         <style>
         .login-container {
@@ -240,7 +237,6 @@ def check_password():
         st.markdown('</div>', unsafe_allow_html=True)
         return False
     
-    # Password correct.
     return True
 
 # ---------- AUTH CHECK ----------
@@ -274,7 +270,6 @@ branches_data = get_branches()
 # Create simple lookup maps
 branch_names = [b['name'] for b in branches_data] if branches_data else []
 branch_id_map = {b['name']: b['id'] for b in branches_data} if branches_data else {}
-branch_code_map = {b['id']: b['code'] for b in branches_data} if branches_data else {}
 
 def reset_pagination():
     st.session_state.prod_page = 0
@@ -339,14 +334,12 @@ class ProgressIndicator:
         self.start_time = time.time()
     
     def __enter__(self):
-        """Initialize progress display"""
         self.progress_bar = st.progress(0)
         self.status_text = st.empty()
         self.status_text.text(f"{self.description} (0/{self.total_steps})")
         return self
     
     def update(self, step: int = 1, status: str = None):
-        """Update progress"""
         self.current_step += step
         progress = min(self.current_step / self.total_steps, 1.0)
         
@@ -364,7 +357,6 @@ class ProgressIndicator:
                 self.status_text.text(f"✅ Complete! ({self.total_steps} items processed in {elapsed:.1f}s)")
     
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Clean up progress display"""
         if exc_type:
             self.status_text.error(f"❌ Error: {str(exc_val)}")
         else:
@@ -375,7 +367,6 @@ class ProgressIndicator:
 
 # ---------- HELPERS ----------
 def validate_csv_columns(df, required_cols, label="CSV"):
-    """Validate CSV has required columns with better error messages"""
     missing = required_cols - set(df.columns)
     if missing:
         logger.warning(f"Missing columns in {label}", {"missing": list(missing)})
@@ -383,13 +374,11 @@ def validate_csv_columns(df, required_cols, label="CSV"):
     return True, ""
 
 def validate_sku_format(sku):
-    """Validate SKU format - alphanumeric, underscores, hyphens only"""
     if not sku or not isinstance(sku, str):
         return False
     return bool(re.match(r'^[A-Za-z0-9_\-\.]+$', sku))
 
 def upload_with_transaction(table_name, records, batch_size=500):
-    """Upload with transaction-like behavior and progress tracking"""
     if not records:
         logger.info(f"No records to upload to {table_name}")
         return True, None, 0
@@ -441,7 +430,6 @@ def upload_with_transaction(table_name, records, batch_size=500):
     return True, None, successful
 
 def bulk_upsert_products(products_data, batch_size=200):
-    """Upsert products with SKU validation and uniqueness check"""
     if not products_data:
         return True, None, 0, 0
     
@@ -499,7 +487,6 @@ def bulk_upsert_products(products_data, batch_size=200):
 
 @cached_with_invalidation(ttl=300, key_prefix="existing_skus")
 def get_existing_skus(sku_list=None):
-    """Get existing SKUs from products table with caching"""
     query = supabase.table("products").select("sku")
     if sku_list:
         all_skus = set()
@@ -521,7 +508,6 @@ def get_existing_skus(sku_list=None):
 
 @cached_with_invalidation(ttl=60, key_prefix="sku_to_id")
 def chunked_sku_lookup(skus, chunk_size=200):
-    """Efficient SKU to ID lookup with caching"""
     if not skus:
         return {}
     
@@ -534,7 +520,6 @@ def chunked_sku_lookup(skus, chunk_size=200):
     return sku_to_id
 
 def ensure_products_exist(skus, default_cost=0.0, default_shelf_life=120):
-    """Ensure products exist, with better error handling and validation"""
     if not skus:
         return {}
     
@@ -571,16 +556,21 @@ def ensure_products_exist(skus, default_cost=0.0, default_shelf_life=120):
     
     return sku_to_id
 
+# FIXED: Better error handling for count
 @cached_with_invalidation(ttl=60, key_prefix="count")
 def get_cached_count(table_or_view, filter_col=None, filter_val=None):
-    """Get count with better caching and pagination support"""
-    query = supabase.table(table_or_view).select("*", head=True, count="exact")
-    if filter_col and filter_val:
-        query = query.eq(filter_col, filter_val)
-    return query.execute().count
+    """Get count with better caching and error handling"""
+    try:
+        query = supabase.table(table_or_view).select("*", head=True, count="exact")
+        if filter_col and filter_val:
+            query = query.eq(filter_col, filter_val)
+        result = query.execute()
+        return result.count if result else 0
+    except Exception as e:
+        logger.error(f"Failed to get count for {table_or_view}", {"error": str(e)})
+        return 0
 
 def search_products(search_term, branch_id=None, limit=100):
-    """Search products by SKU or name with inventory info"""
     search_term = search_term.strip()
     if not search_term:
         return []
@@ -629,7 +619,6 @@ def search_products(search_term, branch_id=None, limit=100):
         return []
 
 def search_inventory(search_term, branch_id=None, limit=100):
-    """Search inventory by product SKU, name, or batch"""
     search_term = search_term.strip()
     if not search_term:
         return []
@@ -656,7 +645,6 @@ def search_inventory(search_term, branch_id=None, limit=100):
 
 # ---------- DATA EXPORT ----------
 def export_data_to_csv(data: List[Dict], filename: str = "export.csv") -> bytes:
-    """Export data to CSV and return as bytes"""
     if not data:
         return b""
     
@@ -666,7 +654,6 @@ def export_data_to_csv(data: List[Dict], filename: str = "export.csv") -> bytes:
     return csv_buffer.getvalue().encode('utf-8')
 
 def export_data_to_excel(data: List[Dict], filename: str = "export.xlsx") -> bytes:
-    """Export data to Excel and return as bytes"""
     if not data:
         return b""
     
@@ -677,19 +664,25 @@ def export_data_to_excel(data: List[Dict], filename: str = "export.xlsx") -> byt
     return excel_buffer.getvalue()
 
 # ============================================================
-# PAGE: DASHBOARD
+# PAGE: DASHBOARD (FIXED)
 # ============================================================
 if page == "Dashboard":
     st.header("📊 Executive Summary")
     
     col1, col2 = st.columns(2)
     
-    if branch_id:
-        total_val = supabase.rpc("get_total_value", {"branch_id_param": branch_id}).execute().data
-        waste_val = supabase.rpc("get_waste_risk", {"branch_id_param": branch_id}).execute().data
-    else:
-        total_val = supabase.rpc("get_total_value_all").execute().data
-        waste_val = supabase.rpc("get_waste_risk_all").execute().data
+    # Safe RPC calls with error handling
+    try:
+        if branch_id:
+            total_val = supabase.rpc("get_total_value", {"branch_id_param": branch_id}).execute().data
+            waste_val = supabase.rpc("get_waste_risk", {"branch_id_param": branch_id}).execute().data
+        else:
+            total_val = supabase.rpc("get_total_value_all").execute().data
+            waste_val = supabase.rpc("get_waste_risk_all").execute().data
+    except Exception as e:
+        logger.error("Failed to get dashboard values", {"error": str(e)})
+        total_val = 0
+        waste_val = 0
     
     total_val = total_val or 0
     waste_val = waste_val or 0
@@ -699,25 +692,29 @@ if page == "Dashboard":
     with col2:
         st.metric("Waste Risk (next 120d)", f"₦{waste_val:,.0f}")
 
-    alert_query = supabase.table("alert_log").select("alert_type, action_taken")
-    if branch_id:
-        alert_query = alert_query.eq("branch_id", branch_id)
-    alerts = alert_query.limit(1000).execute().data
-    
-    if alerts:
-        df_a = pd.DataFrame(alerts)
-        total_alerts = len(df_a)
-        actioned = df_a['action_taken'].notna().sum()
-        compliance = round(actioned / total_alerts * 100, 1) if total_alerts else 0
-        st.metric("Alert Compliance", f"{compliance}%")
+    try:
+        alert_query = supabase.table("alert_log").select("alert_type, action_taken")
+        if branch_id:
+            alert_query = alert_query.eq("branch_id", branch_id)
+        alerts = alert_query.limit(1000).execute().data
         
-        st.subheader("Alert Type Breakdown")
-        st.bar_chart(df_a['alert_type'].value_counts())
-    else:
-        st.info("No alerts yet. Run daily maintenance function.")
+        if alerts:
+            df_a = pd.DataFrame(alerts)
+            total_alerts = len(df_a)
+            actioned = df_a['action_taken'].notna().sum()
+            compliance = round(actioned / total_alerts * 100, 1) if total_alerts else 0
+            st.metric("Alert Compliance", f"{compliance}%")
+            
+            st.subheader("Alert Type Breakdown")
+            st.bar_chart(df_a['alert_type'].value_counts())
+        else:
+            st.info("No alerts yet. Run daily maintenance function.")
+    except Exception as e:
+        logger.error("Failed to fetch alerts", {"error": str(e)})
+        st.info("Alert data not available yet.")
 
 # ============================================================
-# PAGE: PRODUCTS & INVENTORY
+# PAGE: PRODUCTS & INVENTORY (FIXED)
 # ============================================================
 elif page == "Products & Inventory":
     st.header("📦 Products & Inventory Management")
@@ -944,30 +941,34 @@ elif page == "Products & Inventory":
                                    filter_val=branch_id if branch_id else None)
             total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
             
-            query = supabase.table("view_inventory_list").select(
-                "id,branch_id,branch_name,product_id,product_name,sku,cost,batch,quantity,expiry_date,storage_location"
-            )
-            if branch_id:
-                query = query.eq("branch_id", branch_id)
-            inv_data = query.range(offset, offset+PAGE_SIZE-1).execute().data
-            
-            if inv_data:
-                df_i = pd.DataFrame(inv_data)
-                df_i['expiry_display'] = df_i['expiry_date'].apply(lambda x: x if pd.notna(x) else "No expiry")
-                mobile_friendly_table(df_i[['branch_name','product_name','sku','batch','quantity','expiry_display','storage_location']].rename(columns={
-                    'branch_name':'Branch','product_name':'Product','expiry_display':'Expiry Date'
-                }))
+            try:
+                query = supabase.table("view_inventory_list").select(
+                    "id,branch_id,branch_name,product_id,product_name,sku,cost,batch,quantity,expiry_date,storage_location"
+                )
+                if branch_id:
+                    query = query.eq("branch_id", branch_id)
+                inv_data = query.range(offset, offset+PAGE_SIZE-1).execute().data
                 
-                col1, col2 = st.columns(2)
-                if col1.button("⬅️ Prev", disabled=st.session_state.inv_page==0):
-                    st.session_state.inv_page -= 1
-                    st.rerun()
-                if col2.button("Next ➡️", disabled=st.session_state.inv_page>=total_pages-1):
-                    st.session_state.inv_page += 1
-                    st.rerun()
-                st.caption(f"Page {st.session_state.inv_page+1} of {total_pages}")
-            else:
-                st.info("No inventory records found.")
+                if inv_data:
+                    df_i = pd.DataFrame(inv_data)
+                    df_i['expiry_display'] = df_i['expiry_date'].apply(lambda x: x if pd.notna(x) else "No expiry")
+                    mobile_friendly_table(df_i[['branch_name','product_name','sku','batch','quantity','expiry_display','storage_location']].rename(columns={
+                        'branch_name':'Branch','product_name':'Product','expiry_display':'Expiry Date'
+                    }))
+                    
+                    col1, col2 = st.columns(2)
+                    if col1.button("⬅️ Prev", disabled=st.session_state.inv_page==0):
+                        st.session_state.inv_page -= 1
+                        st.rerun()
+                    if col2.button("Next ➡️", disabled=st.session_state.inv_page>=total_pages-1):
+                        st.session_state.inv_page += 1
+                        st.rerun()
+                    st.caption(f"Page {st.session_state.inv_page+1} of {total_pages}")
+                else:
+                    st.info("No inventory records found.")
+            except Exception as e:
+                logger.error("Failed to fetch inventory", {"error": str(e)})
+                st.error("Unable to load inventory data. Please check database connection.")
         
         else:
             st.subheader("📋 All Products")
@@ -979,90 +980,95 @@ elif page == "Products & Inventory":
             total = get_cached_count("products")
             total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
             
-            prods = supabase.table("products").select("id,sku,name,category,shelf_life_days,cost").range(offset, offset+PAGE_SIZE-1).execute().data
-            
-            if prods:
-                df_p = pd.DataFrame(prods)
-                mobile_friendly_table(df_p[['sku','name','category','shelf_life_days','cost']])
+            try:
+                prods = supabase.table("products").select("id,sku,name,category,shelf_life_days,cost").range(offset, offset+PAGE_SIZE-1).execute().data
                 
-                col1, col2 = st.columns(2)
-                if col1.button("⬅️ Prev", disabled=st.session_state.prod_page==0):
-                    st.session_state.prod_page -= 1
-                    st.rerun()
-                if col2.button("Next ➡️", disabled=st.session_state.prod_page>=total_pages-1):
-                    st.session_state.prod_page += 1
-                    st.rerun()
-                st.caption(f"Page {st.session_state.prod_page+1} of {total_pages}")
-                
-                st.subheader("✏️ Edit Product")
-                product_options = [f"{p['sku']} - {p['name']}" for p in prods]
-                selected_option = st.selectbox("Select product to edit", product_options, key="edit_product_select")
-                
-                if selected_option:
-                    selected_sku = selected_option.split(" - ")[0]
-                    product = next(p for p in prods if p['sku'] == selected_sku)
+                if prods:
+                    df_p = pd.DataFrame(prods)
+                    mobile_friendly_table(df_p[['sku','name','category','shelf_life_days','cost']])
                     
-                    with st.form(key=f"edit_product_form_main"):
-                        st.markdown(f"**Editing:** {product['sku']} - {product['name']}")
+                    col1, col2 = st.columns(2)
+                    if col1.button("⬅️ Prev", disabled=st.session_state.prod_page==0):
+                        st.session_state.prod_page -= 1
+                        st.rerun()
+                    if col2.button("Next ➡️", disabled=st.session_state.prod_page>=total_pages-1):
+                        st.session_state.prod_page += 1
+                        st.rerun()
+                    st.caption(f"Page {st.session_state.prod_page+1} of {total_pages}")
+                    
+                    st.subheader("✏️ Edit Product")
+                    if prods:
+                        product_options = [f"{p['sku']} - {p['name']}" for p in prods]
+                        selected_option = st.selectbox("Select product to edit", product_options, key="edit_product_select")
                         
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            edit_name = st.text_input("Product Name", value=product['name'])
-                            edit_category = st.text_input("Category", value=product.get('category', ''))
-                        with col2:
-                            edit_shelf_life = st.number_input("Shelf Life (days)", min_value=1, value=product['shelf_life_days'])
-                            edit_cost = st.number_input("Unit Cost (₦)", min_value=0.0, value=float(product['cost']), format="%.2f")
-                        
-                        col1, col2, col3 = st.columns(3)
-                        with col1:
-                            if st.form_submit_button("💾 Save Changes", use_container_width=True):
-                                try:
-                                    update_data = {}
-                                    if edit_name != product['name']:
-                                        update_data['name'] = edit_name
-                                    if edit_category != product.get('category', ''):
-                                        update_data['category'] = edit_category or None
-                                    if edit_shelf_life != product['shelf_life_days']:
-                                        update_data['shelf_life_days'] = edit_shelf_life
-                                    if edit_cost != float(product['cost']):
-                                        update_data['cost'] = edit_cost
-                                    
-                                    if update_data:
-                                        supabase.table("products").update(update_data).eq("id", product['id']).execute()
-                                        st.success("✅ Product updated successfully!")
-                                        logger.info(f"Product updated", {"sku": product['sku'], "updated_fields": list(update_data.keys())})
-                                        CacheManager.invalidate_all()
+                        if selected_option:
+                            selected_sku = selected_option.split(" - ")[0]
+                            product = next(p for p in prods if p['sku'] == selected_sku)
+                            
+                            with st.form(key=f"edit_product_form_main"):
+                                st.markdown(f"**Editing:** {product['sku']} - {product['name']}")
+                                
+                                col1, col2 = st.columns(2)
+                                with col1:
+                                    edit_name = st.text_input("Product Name", value=product['name'])
+                                    edit_category = st.text_input("Category", value=product.get('category', ''))
+                                with col2:
+                                    edit_shelf_life = st.number_input("Shelf Life (days)", min_value=1, value=product['shelf_life_days'])
+                                    edit_cost = st.number_input("Unit Cost (₦)", min_value=0.0, value=float(product['cost']), format="%.2f")
+                                
+                                col1, col2, col3 = st.columns(3)
+                                with col1:
+                                    if st.form_submit_button("💾 Save Changes", use_container_width=True):
+                                        try:
+                                            update_data = {}
+                                            if edit_name != product['name']:
+                                                update_data['name'] = edit_name
+                                            if edit_category != product.get('category', ''):
+                                                update_data['category'] = edit_category or None
+                                            if edit_shelf_life != product['shelf_life_days']:
+                                                update_data['shelf_life_days'] = edit_shelf_life
+                                            if edit_cost != float(product['cost']):
+                                                update_data['cost'] = edit_cost
+                                            
+                                            if update_data:
+                                                supabase.table("products").update(update_data).eq("id", product['id']).execute()
+                                                st.success("✅ Product updated successfully!")
+                                                logger.info(f"Product updated", {"sku": product['sku'], "updated_fields": list(update_data.keys())})
+                                                CacheManager.invalidate_all()
+                                                st.rerun()
+                                            else:
+                                                st.info("No changes made.")
+                                        except Exception as e:
+                                            logger.error(f"Failed to update product", {"sku": product['sku'], "error": str(e)})
+                                            st.error(f"Failed to update: {e}")
+                                
+                                with col2:
+                                    if st.form_submit_button("🗑️ Delete Product", use_container_width=True, type="secondary"):
+                                        st.warning("⚠️ Warning: This will delete the product and all associated inventory.")
+                                        confirm_delete = st.checkbox("Confirm deletion", key="confirm_delete_main")
+                                        if confirm_delete:
+                                            try:
+                                                supabase.table("inventory").delete().eq("product_id", product['id']).execute()
+                                                supabase.table("products").delete().eq("id", product['id']).execute()
+                                                st.success("✅ Product and associated inventory deleted.")
+                                                logger.info(f"Product deleted", {"sku": product['sku']})
+                                                CacheManager.invalidate_all()
+                                                st.rerun()
+                                            except Exception as e:
+                                                logger.error(f"Failed to delete product", {"sku": product['sku'], "error": str(e)})
+                                                st.error(f"Failed to delete: {e}")
+                                
+                                with col3:
+                                    if st.form_submit_button("🔄 Reset Values", use_container_width=True):
                                         st.rerun()
-                                    else:
-                                        st.info("No changes made.")
-                                except Exception as e:
-                                    logger.error(f"Failed to update product", {"sku": product['sku'], "error": str(e)})
-                                    st.error(f"Failed to update: {e}")
-                        
-                        with col2:
-                            if st.form_submit_button("🗑️ Delete Product", use_container_width=True, type="secondary"):
-                                st.warning("⚠️ Warning: This will delete the product and all associated inventory.")
-                                confirm_delete = st.checkbox("Confirm deletion", key="confirm_delete_main")
-                                if confirm_delete:
-                                    try:
-                                        supabase.table("inventory").delete().eq("product_id", product['id']).execute()
-                                        supabase.table("products").delete().eq("id", product['id']).execute()
-                                        st.success("✅ Product and associated inventory deleted.")
-                                        logger.info(f"Product deleted", {"sku": product['sku']})
-                                        CacheManager.invalidate_all()
-                                        st.rerun()
-                                    except Exception as e:
-                                        logger.error(f"Failed to delete product", {"sku": product['sku'], "error": str(e)})
-                                        st.error(f"Failed to delete: {e}")
-                        
-                        with col3:
-                            if st.form_submit_button("🔄 Reset Values", use_container_width=True):
-                                st.rerun()
-            else:
-                st.info("No products found. Add your first product above!")
+                else:
+                    st.info("No products found. Add your first product above!")
+            except Exception as e:
+                logger.error("Failed to fetch products", {"error": str(e)})
+                st.error("Unable to load products. Please check database connection.")
 
 # ============================================================
-# PAGE: BRANCHES
+# PAGE: BRANCHES (Keep the rest of the pages as they were)
 # ============================================================
 elif page == "Branches":
     st.header("🏢 Branch Management")
@@ -1076,7 +1082,6 @@ elif page == "Branches":
     
     @cached_with_invalidation(ttl=60, key_prefix="branches_full")
     def get_branches_full():
-        """Get branches with all fields including emails"""
         try:
             data = supabase.table("branches").select(
                 "id,name,code,storekeeper_email,procurement_email,inventory_email,auditor_email,manager_email"
@@ -1285,7 +1290,7 @@ elif page == "Branches":
                 st.error(err)
 
 # ============================================================
-# PAGE: CSV UPLOAD
+# PAGE: CSV UPLOAD (Simplified - keep existing)
 # ============================================================
 elif page == "CSV Upload":
     st.header("📁 Upload Inventory or Movement Data")
@@ -1806,8 +1811,7 @@ elif page == "Data Export":
         "Stock Limits",
         "Risk Scores",
         "Alert Log",
-        "Transfer Suggestions",
-        "Registered Users"
+        "Transfer Suggestions"
     ])
     
     format_type = st.selectbox("Export format", ["CSV", "Excel"])
@@ -1855,50 +1859,6 @@ elif page == "Data Export":
                         query = query.eq("from_branch_id", branch_id)
                     data = query.execute().data
                     filename = f"transfer_suggestions_{datetime.now().strftime('%Y%m%d')}"
-                
-                elif export_type == "Registered Users":
-                    data = []
-                    try:
-                        branches = supabase.table("branches").select("*").execute().data
-                        for branch in branches:
-                            if branch.get('manager_email'):
-                                data.append({
-                                    "Email": branch['manager_email'],
-                                    "Role": "Manager",
-                                    "Access Level": "Admin",
-                                    "Branches": branch['name']
-                                })
-                            if branch.get('storekeeper_email'):
-                                data.append({
-                                    "Email": branch['storekeeper_email'],
-                                    "Role": "Storekeeper",
-                                    "Access Level": "Viewer",
-                                    "Branches": branch['name']
-                                })
-                            if branch.get('procurement_email'):
-                                data.append({
-                                    "Email": branch['procurement_email'],
-                                    "Role": "Procurement",
-                                    "Access Level": "Viewer",
-                                    "Branches": branch['name']
-                                })
-                            if branch.get('inventory_email'):
-                                data.append({
-                                    "Email": branch['inventory_email'],
-                                    "Role": "Inventory",
-                                    "Access Level": "Viewer",
-                                    "Branches": branch['name']
-                                })
-                            if branch.get('auditor_email'):
-                                data.append({
-                                    "Email": branch['auditor_email'],
-                                    "Role": "Auditor",
-                                    "Access Level": "Viewer",
-                                    "Branches": branch['name']
-                                })
-                    except:
-                        data = [{"message": "Unable to fetch users"}]
-                    filename = f"registered_users_{datetime.now().strftime('%Y%m%d')}"
                 
                 if data:
                     if format_type == "CSV":
