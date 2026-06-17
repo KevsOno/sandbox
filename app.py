@@ -1997,6 +1997,7 @@ elif page == "CSV Upload":
                 else:
                     st.error(err)
 
+
 # ============================================================
 # PAGE: ALERTS & ADVISORIES - WITH ACTION HANDLING
 # ============================================================
@@ -2133,11 +2134,23 @@ elif page == "Alerts & Advisories":
                         key=f"action_type_{row['id']}"
                     )
                     
+                    # Get max quantity from alert details or use a default
+                    max_qty = 1000  # Default fallback
+                    if row.get('details'):
+                        try:
+                            # Try to extract quantity from details
+                            import re
+                            qty_match = re.search(r'(\d+)\s*units?', str(row['details']))
+                            if qty_match:
+                                max_qty = int(qty_match.group(1))
+                        except:
+                            pass
+                    
                     action_qty = st.number_input(
                         "Quantity to action",
                         min_value=1,
-                        max_value=1000000,
-                        value=1,
+                        max_value=max_qty,
+                        value=min(1, max_qty),
                         key=f"action_qty_{row['id']}"
                     )
                     
@@ -2199,7 +2212,8 @@ elif page == "Alerts & Advisories":
                                             time.sleep(1)
                                             st.rerun()
                                         else:
-                                            st.error(f"Action failed: {result.data.get('error', 'Unknown error')}")
+                                            error_msg = result.data.get('error', 'Unknown error') if result.data else 'No response'
+                                            st.error(f"Action failed: {error_msg}")
                                             
                                 except Exception as e:
                                     logger.error(f"Failed to execute alert action", {
@@ -2235,10 +2249,18 @@ elif page == "Alerts & Advisories":
                                 st.write(f"**Quantity affected:** {row['affected_quantity']} units")
             
             with col3:
-                # Show age of alert
-                created_at = pd.to_datetime(row['created_at'])
-                age_days = (datetime.now() - created_at).days
-                st.caption(f"Alert age: {age_days} days")
+                # Show age of alert - FIXED: properly convert to datetime
+                try:
+                    created_at = row['created_at']
+                    if isinstance(created_at, str):
+                        created_at = pd.to_datetime(created_at)
+                    elif isinstance(created_at, pd.Timestamp):
+                        created_at = created_at.to_pydatetime()
+                    
+                    age_days = (datetime.now() - created_at).days
+                    st.caption(f"Alert age: {age_days} days")
+                except Exception as e:
+                    st.caption(f"Alert age: N/A")
                 
                 # Quick action for critical alerts
                 if not is_resolved and "CRITICAL" in row['alert_type']:
@@ -2262,7 +2284,8 @@ elif page == "Alerts & Advisories":
                                 time.sleep(1)
                                 st.rerun()
                             else:
-                                st.error(f"Quick consume failed: {result.data.get('error', 'Unknown error')}")
+                                error_msg = result.data.get('error', 'Unknown error') if result.data else 'No response'
+                                st.error(f"Quick consume failed: {error_msg}")
                         except Exception as e:
                             st.error(f"Quick consume failed: {str(e)}")
             
