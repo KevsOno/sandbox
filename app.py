@@ -1289,7 +1289,7 @@ if page == "Dashboard":
         st.info("No alerts yet. Run daily maintenance function.")
 
 # ============================================================
-# PAGE: PRODUCTS & INVENTORY (OPTIMIZED)
+# PAGE: PRODUCTS & INVENTORY (OPTIMIZED WITH FIXED EDIT)
 # ============================================================
 elif page == "Products & Inventory":
     st.header("📦 Products & Inventory Management")
@@ -1328,11 +1328,13 @@ elif page == "Products & Inventory":
             st.session_state.show_all_products = True
             st.session_state.show_inventory = False
             st.session_state.show_search_results = False
+            st.session_state.show_edit_product = False
     with col3:
         if st.button("📦 Inventory", use_container_width=True):
             st.session_state.show_inventory = True
             st.session_state.show_all_products = False
             st.session_state.show_search_results = False
+            st.session_state.show_edit_product = False
     with col4:
         if st.button("🔄 Refresh", use_container_width=True):
             CacheManager.invalidate_all()
@@ -1352,6 +1354,10 @@ elif page == "Products & Inventory":
         st.session_state.show_search_results = False
     if "search_page" not in st.session_state:
         st.session_state.search_page = 0
+    if "show_edit_product" not in st.session_state:
+        st.session_state.show_edit_product = False
+    if "edit_product" not in st.session_state:
+        st.session_state.edit_product = None
     
     # Add Product Form
     if st.session_state.show_add_product:
@@ -1395,6 +1401,71 @@ elif page == "Products & Inventory":
                 with col2:
                     if st.form_submit_button("❌ Cancel", use_container_width=True):
                         st.session_state.show_add_product = False
+                        st.rerun()
+    
+    # Edit Product Form - FIXED
+    if st.session_state.show_edit_product and st.session_state.edit_product:
+        with st.expander("✏️ Edit Product", expanded=True):
+            product = st.session_state.edit_product
+            with st.form(key=f"edit_product_form_{product['id']}"):
+                st.info(f"Editing: **{product['name']}** (SKU: `{product['sku']}`)")
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    new_name = st.text_input("Product Name*", value=product['name'])
+                    new_category = st.text_input("Category", value=product.get('category', ''))
+                with col2:
+                    new_shelf_life = st.number_input("Shelf Life (days)", min_value=1, value=product.get('shelf_life_days', 120))
+                    new_cost = st.number_input("Unit Cost (₦)", min_value=0.0, value=float(product.get('cost', 0)), format="%.2f")
+                
+                # Show current product info
+                st.caption(f"SKU: `{product['sku']}` (cannot be changed)")
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    if st.form_submit_button("💾 Save Changes", use_container_width=True):
+                        if not new_name:
+                            st.error("Product name is required.")
+                        else:
+                            try:
+                                update_data = {
+                                    "name": new_name,
+                                    "category": new_category or None,
+                                    "shelf_life_days": new_shelf_life,
+                                    "cost": new_cost
+                                }
+                                supabase.table("products").update(update_data).eq("id", product['id']).execute()
+                                st.success(f"✅ Product '{new_name}' updated successfully!")
+                                logger.info(f"Product updated", {"sku": product['sku'], "id": product['id']})
+                                CacheManager.invalidate_all()
+                                st.session_state.show_edit_product = False
+                                st.session_state.edit_product = None
+                                st.rerun()
+                            except Exception as e:
+                                logger.error(f"Failed to update product", {"sku": product['sku'], "error": str(e)})
+                                st.error(f"Failed to update product: {e}")
+                
+                with col2:
+                    if st.form_submit_button("🗑️ Delete Product", use_container_width=True):
+                        st.warning("⚠️ Warning: This will delete the product and all associated inventory.")
+                        if st.checkbox("Confirm deletion", key=f"confirm_delete_edit_{product['id']}"):
+                            try:
+                                supabase.table("inventory").delete().eq("product_id", product['id']).execute()
+                                supabase.table("products").delete().eq("id", product['id']).execute()
+                                st.success("✅ Product and associated inventory deleted.")
+                                logger.info(f"Product deleted", {"sku": product['sku'], "id": product['id']})
+                                CacheManager.invalidate_all()
+                                st.session_state.show_edit_product = False
+                                st.session_state.edit_product = None
+                                st.rerun()
+                            except Exception as e:
+                                logger.error(f"Failed to delete product", {"sku": product['sku'], "error": str(e)})
+                                st.error(f"Failed to delete: {e}")
+                
+                with col3:
+                    if st.form_submit_button("❌ Cancel", use_container_width=True):
+                        st.session_state.show_edit_product = False
+                        st.session_state.edit_product = None
                         st.rerun()
     
     # Search Results - OPTIMIZED SECTION
@@ -1446,8 +1517,11 @@ elif page == "Products & Inventory":
                         with col3:
                             if product.get('location_count', 0) > 0:
                                 st.metric("Locations", product.get('location_count', 0))
-                            if st.button(f"✏️ Edit", key=f"edit_{product['id']}"):
+                            # FIXED: Edit button now properly triggers edit mode
+                            if st.button(f"✏️ Edit Product", key=f"edit_btn_{product['id']}"):
                                 st.session_state.edit_product = product
+                                st.session_state.show_edit_product = True
+                                st.rerun()
                         
                         if product.get('inventory'):
                             st.subheader("Inventory Locations")
@@ -1597,50 +1671,64 @@ elif page == "Products & Inventory":
                     st.rerun()
                 st.caption(f"Page {st.session_state.prod_page+1} of {total_pages}")
                 
+                # FIXED: Edit product section
                 st.subheader("✏️ Edit Product")
                 edit_sku = st.selectbox("Select product to edit", [p['sku'] for p in prods])
                 if edit_sku:
                     product = next(p for p in prods if p['sku'] == edit_sku)
-                    with st.form("edit_product_form"):
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            new_name = st.text_input("Product Name", value=product['name'])
-                            new_category = st.text_input("Category", value=product.get('category', ''))
-                        with col2:
-                            new_shelf_life = st.number_input("Shelf Life (days)", min_value=1, value=product['shelf_life_days'])
-                            new_cost = st.number_input("Unit Cost (₦)", min_value=0.0, value=float(product['cost']), format="%.2f")
+                    with st.form(key=f"edit_product_form_main_{product['id']}"):
+                        st.info(f"Editing: **{product['name']}** (SKU: `{product['sku']}`)")
                         
                         col1, col2 = st.columns(2)
                         with col1:
+                            new_name = st.text_input("Product Name*", value=product['name'])
+                            new_category = st.text_input("Category", value=product.get('category', ''))
+                        with col2:
+                            new_shelf_life = st.number_input("Shelf Life (days)", min_value=1, value=product.get('shelf_life_days', 120))
+                            new_cost = st.number_input("Unit Cost (₦)", min_value=0.0, value=float(product.get('cost', 0)), format="%.2f")
+                        
+                        st.caption(f"SKU: `{product['sku']}` (cannot be changed)")
+                        
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
                             if st.form_submit_button("💾 Save Changes", use_container_width=True):
-                                try:
-                                    supabase.table("products").update({
-                                        "name": new_name,
-                                        "category": new_category or None,
-                                        "shelf_life_days": new_shelf_life,
-                                        "cost": new_cost
-                                    }).eq("id", product['id']).execute()
-                                    st.success("✅ Product updated successfully!")
-                                    logger.info(f"Product updated", {"sku": edit_sku})
-                                    CacheManager.invalidate_all()
-                                    st.rerun()
-                                except Exception as e:
-                                    logger.error(f"Failed to update product", {"sku": edit_sku, "error": str(e)})
-                                    st.error(f"Failed to update: {e}")
+                                if not new_name:
+                                    st.error("Product name is required.")
+                                else:
+                                    try:
+                                        update_data = {
+                                            "name": new_name,
+                                            "category": new_category or None,
+                                            "shelf_life_days": new_shelf_life,
+                                            "cost": new_cost
+                                        }
+                                        supabase.table("products").update(update_data).eq("id", product['id']).execute()
+                                        st.success(f"✅ Product '{new_name}' updated successfully!")
+                                        logger.info(f"Product updated", {"sku": product['sku'], "id": product['id']})
+                                        CacheManager.invalidate_all()
+                                        st.rerun()
+                                    except Exception as e:
+                                        logger.error(f"Failed to update product", {"sku": product['sku'], "error": str(e)})
+                                        st.error(f"Failed to update product: {e}")
+                        
                         with col2:
                             if st.form_submit_button("🗑️ Delete Product", use_container_width=True):
                                 st.warning("⚠️ Warning: This will delete the product and all associated inventory.")
-                                if st.checkbox("Confirm deletion"):
+                                if st.checkbox("Confirm deletion", key=f"confirm_delete_main_{product['id']}"):
                                     try:
                                         supabase.table("inventory").delete().eq("product_id", product['id']).execute()
                                         supabase.table("products").delete().eq("id", product['id']).execute()
                                         st.success("✅ Product and associated inventory deleted.")
-                                        logger.info(f"Product deleted", {"sku": edit_sku})
+                                        logger.info(f"Product deleted", {"sku": product['sku'], "id": product['id']})
                                         CacheManager.invalidate_all()
                                         st.rerun()
                                     except Exception as e:
-                                        logger.error(f"Failed to delete product", {"sku": edit_sku, "error": str(e)})
+                                        logger.error(f"Failed to delete product", {"sku": product['sku'], "error": str(e)})
                                         st.error(f"Failed to delete: {e}")
+                        
+                        with col3:
+                            if st.form_submit_button("🔄 Cancel", use_container_width=True):
+                                st.rerun()
             else:
                 st.info("No products found. Add your first product above!")
 
