@@ -35,113 +35,8 @@ def enforce_https():
             if not st.session_state.get("_https_checked", False):
                 st.session_state._https_checked = True
                 logger.info("HTTPS enforcement active in production")
-                
-                st.markdown("""
-                <style>
-                .security-notice {
-                    background-color: #f0f8ff;
-                    padding: 10px;
-                    border-radius: 5px;
-                    border-left: 4px solid #0066cc;
-                    margin-bottom: 20px;
-                }
-                </style>
-                """, unsafe_allow_html=True)
         except Exception as e:
-            # Use print since logger might not be initialized yet
             print(f"Could not check HTTPS status: {e}")
-
-# ---------- RATE LIMITING ----------
-class RateLimiter:
-    """Simple rate limiter for login attempts and sensitive operations"""
-    
-    def __init__(self, max_attempts: int = 5, window_seconds: int = 300):
-        self.max_attempts = max_attempts
-        self.window_seconds = window_seconds
-        self.attempts = {}
-    
-    def is_allowed(self, key: str) -> bool:
-        """Check if a key is allowed to proceed"""
-        current_time = time.time()
-        
-        self.attempts = {
-            k: v for k, v in self.attempts.items()
-            if current_time - v['last_attempt'] < self.window_seconds
-        }
-        
-        if key not in self.attempts:
-            self.attempts[key] = {
-                'count': 1,
-                'last_attempt': current_time,
-                'blocked_until': None
-            }
-            return True
-        
-        if self.attempts[key].get('blocked_until') and current_time < self.attempts[key]['blocked_until']:
-            return False
-        
-        if self.attempts[key]['count'] >= self.max_attempts:
-            self.attempts[key]['blocked_until'] = current_time + self.window_seconds
-            return False
-        
-        self.attempts[key]['count'] += 1
-        self.attempts[key]['last_attempt'] = current_time
-        return True
-    
-    def reset(self, key: str):
-        """Reset attempts for a key"""
-        if key in self.attempts:
-            del self.attempts[key]
-
-# ---------- PASSWORD VALIDATION ----------
-class PasswordValidator:
-    """Enforce strong password policies"""
-    
-    MIN_LENGTH = 12
-    REQUIRE_UPPERCASE = True
-    REQUIRE_LOWERCASE = True
-    REQUIRE_DIGITS = True
-    REQUIRE_SPECIAL = True
-    SPECIAL_CHARS = "!@#$%^&*(),.?\":{}|<>"
-    
-    @classmethod
-    def validate(cls, password: str) -> Tuple[bool, str]:
-        """Validate password against policy"""
-        if not password or len(password) < cls.MIN_LENGTH:
-            return False, f"Password must be at least {cls.MIN_LENGTH} characters long."
-        
-        if cls.REQUIRE_UPPERCASE and not any(c.isupper() for c in password):
-            return False, "Password must contain at least one uppercase letter."
-        
-        if cls.REQUIRE_LOWERCASE and not any(c.islower() for c in password):
-            return False, "Password must contain at least one lowercase letter."
-        
-        if cls.REQUIRE_DIGITS and not any(c.isdigit() for c in password):
-            return False, "Password must contain at least one digit."
-        
-        if cls.REQUIRE_SPECIAL and not any(c in cls.SPECIAL_CHARS for c in password):
-            return False, f"Password must contain at least one special character: {cls.SPECIAL_CHARS}"
-        
-        common_patterns = [
-            "password", "123456", "qwerty", "admin", "letmein", 
-            "welcome", "monkey", "dragon", "master", "hello"
-        ]
-        if any(pattern in password.lower() for pattern in common_patterns):
-            return False, "Password contains common patterns and is too weak."
-        
-        if len(password) >= 3:
-            for i in range(len(password) - 2):
-                if password[i] == password[i+1] == password[i+2]:
-                    return False, "Password contains repeated characters (3 or more in a row)."
-        
-        return True, "Password is strong."
-    
-    @classmethod
-    def generate_strong_password(cls) -> str:
-        """Generate a strong password"""
-        alphabet = string.ascii_letters + string.digits + cls.SPECIAL_CHARS
-        password = ''.join(secrets.choice(alphabet) for _ in range(cls.MIN_LENGTH))
-        return password
 
 # ---------- STRUCTURED LOGGING ----------
 class StructuredLogger:
@@ -254,432 +149,154 @@ def cached_with_invalidation(ttl=300, key_prefix=""):
     return decorator
 
 # Initialize rate limiter
-login_limiter = RateLimiter(max_attempts=5, window_seconds=300)
 api_limiter = RateLimiter(max_attempts=100, window_seconds=60)
 
-# ---------- GET REGISTERED EMAILS ----------
-@cached_with_invalidation(ttl=300, key_prefix="registered_emails")
-def get_registered_emails():
-    """Get all registered emails from branches with their roles"""
-    try:
-        # Get all branches with email fields
-        branches = supabase.table("branches").select(
-            "id, name, code, storekeeper_email, procurement_email, inventory_email, auditor_email, dev_team, manager_email"
-        ).execute().data
+# ---------- RATE LIMITING ----------
+class RateLimiter:
+    """Simple rate limiter for login attempts and sensitive operations"""
+    
+    def __init__(self, max_attempts: int = 5, window_seconds: int = 300):
+        self.max_attempts = max_attempts
+        self.window_seconds = window_seconds
+        self.attempts = {}
+    
+    def is_allowed(self, key: str) -> bool:
+        """Check if a key is allowed to proceed"""
+        current_time = time.time()
         
-        email_map = {}
+        self.attempts = {
+            k: v for k, v in self.attempts.items()
+            if current_time - v['last_attempt'] < self.window_seconds
+        }
         
-        for branch in branches:
-            branch_name = branch.get('name', 'Unknown')
-            
-            # Check each email field
-            if branch.get('storekeeper_email'):
-                email = branch['storekeeper_email']
-                if email not in email_map:
-                    email_map[email] = {
-                        'email': email,
-                        'role': 'Storekeeper',
-                        'access': 'Viewer',
-                        'branches': []
-                    }
-                email_map[email]['branches'].append({
-                    'name': branch_name,
-                    'role': 'Storekeeper'
-                })
+        if key not in self.attempts:
+            self.attempts[key] = {
+                'count': 1,
+                'last_attempt': current_time,
+                'blocked_until': None
+            }
+            return True
+        
+        if self.attempts[key].get('blocked_until') and current_time < self.attempts[key]['blocked_until']:
+            return False
+        
+        if self.attempts[key]['count'] >= self.max_attempts:
+            self.attempts[key]['blocked_until'] = current_time + self.window_seconds
+            return False
+        
+        self.attempts[key]['count'] += 1
+        self.attempts[key]['last_attempt'] = current_time
+        return True
+    
+    def reset(self, key: str):
+        """Reset attempts for a key"""
+        if key in self.attempts:
+            del self.attempts[key]
 
-            if branch.get('dev_team'):
-                email = branch['dev_team']
-                if email not in email_map:
-                    email_map[email] = {
-                        'email': email,
-                        'role': 'Solutions Engineer',
-                        'access': 'Admin',
-                        'branches': []
-                    }
-                email_map[email]['branches'].append({
-                    'name': branch_name,
-                    'role': 'Engineer'
-                })
-            
-            if branch.get('procurement_email'):
-                email = branch['procurement_email']
-                if email not in email_map:
-                    email_map[email] = {
-                        'email': email,
-                        'role': 'Procurement',
-                        'access': 'Viewer',
-                        'branches': []
-                    }
-                email_map[email]['branches'].append({
-                    'name': branch_name,
-                    'role': 'Procurement'
-                })
-            
-            if branch.get('inventory_email'):
-                email = branch['inventory_email']
-                if email not in email_map:
-                    email_map[email] = {
-                        'email': email,
-                        'role': 'Inventory',
-                        'access': 'Viewer',
-                        'branches': []
-                    }
-                email_map[email]['branches'].append({
-                    'name': branch_name,
-                    'role': 'Inventory'
-                })
-            
-            if branch.get('auditor_email'):
-                email = branch['auditor_email']
-                if email not in email_map:
-                    email_map[email] = {
-                        'email': email,
-                        'role': 'Auditor',
-                        'access': 'Viewer',
-                        'branches': []
-                    }
-                email_map[email]['branches'].append({
-                    'name': branch_name,
-                    'role': 'Auditor'
-                })
-            
-            if branch.get('manager_email'):
-                email = branch['manager_email']
-                if email not in email_map:
-                    email_map[email] = {
-                        'email': email,
-                        'role': 'Manager',
-                        'access': 'Admin',
-                        'branches': []
-                    }
-                email_map[email]['branches'].append({
-                    'name': branch_name,
-                    'role': 'Manager'
-                })
-        
-        # Check for additional admin emails from secrets
-        admin_emails = st.secrets.get("ADMIN_EMAILS", "").split(",")
-        admin_emails = [e.strip() for e in admin_emails if e.strip()]
-        
-        # Add dev_team as admin
-        dev_team_email = st.secrets.get("DEV_TEAM_EMAIL", "dev_team@company.com")
-        if dev_team_email:
-            admin_emails.append(dev_team_email)
-        
-        for admin_email in admin_emails:
-            if admin_email in email_map:
-                email_map[admin_email]['access'] = 'Admin'
-                email_map[admin_email]['role'] = 'Admin (Additional)'
-            else:
-                # Admin email not in any branch
-                email_map[admin_email] = {
-                    'email': admin_email,
-                    'role': 'Admin (System)',
-                    'access': 'Admin',
-                    'branches': []
-                }
-        
-        return list(email_map.values())
-    
-    except Exception as e:
-        logger.error(f"Failed to get registered emails", {"error": str(e)})
-        return []
+# ---------- SIMPLE PASSWORD AUTH ----------
+def check_password():
+    """Returns `True` if the user had the correct password."""
 
-# ---------- AUTH WITH EMAIL-BASED LOGIN ----------
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
-    st.session_state.user_role = None
-    st.session_state.login_attempts = 0
-    st.session_state.last_login_attempt = None
-    st.session_state.user_email = None
-    st.session_state.user_branches = []
-    st.session_state.user_role_match = None
-
-if not st.session_state.authenticated:
-    # Check rate limiting for login
-    client_ip = st.query_params.get("client_ip", "unknown")
-    login_key = f"login_{client_ip}"
-    
-    if not login_limiter.is_allowed(login_key):
-        remaining_time = int(login_limiter.attempts.get(login_key, {}).get('blocked_until', time.time()) - time.time())
-        st.error(f"🔒 Too many failed login attempts. Please wait {remaining_time} seconds before trying again.")
-        logger.warning("Rate limit exceeded for login", {"client_ip": client_ip}, security=True)
-        st.stop()
-    
-    st.markdown("""
-    <style>
-    .login-container {
-        max-width: 400px;
-        margin: 0 auto;
-        padding: 20px;
-        background-color: #f8f9fa;
-        border-radius: 10px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-    }
-    .login-container h1 {
-        text-align: center;
-        margin-bottom: 20px;
-    }
-    .login-container .stTextInput {
-        margin-bottom: 15px;
-    }
-    .login-container .stButton {
-        margin-top: 10px;
-    }
-    .login-help {
-        font-size: 0.9em;
-        color: #666;
-        margin-top: 15px;
-        padding: 10px;
-        background-color: #fff3cd;
-        border-radius: 5px;
-        border-left: 4px solid #ffc107;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-    
-    st.markdown('<div class="login-container">', unsafe_allow_html=True)
-    
-    # Center the icon
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col2:
-        st.image("https://img.icons8.com/color/96/000000/inventory.png", width=80)
-    
-    st.title("🔐 Inventory Management System")
-    
-    st.markdown("---")
-    
-    # Regular login
-    email = st.text_input("📧 Email Address", placeholder="your.email@company.com", key="login_email")
-    pwd = st.text_input("🔑 Password", type="password", key="login_password")
-    
-    # Show password requirements info
-    with st.expander("📋 Password Information", expanded=False):
-        st.markdown("""
-        - **Admin users** (Managers) use the **Admin Password**
-        - **Viewer users** (Storekeepers, Procurement, Inventory, Auditors) use the **Viewer Password**
-        - Contact your system administrator if you don't have your password
-        """)
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        login_btn = st.button("🔓 Login", use_container_width=True)
-    with col2:
-        if st.button("❓ Help", use_container_width=True):
-            st.info("Use your registered email address and the system password provided by your administrator.")
-    
-    if login_btn:
-        if not email or not pwd:
-            st.error("Please enter both email and password.")
+    def password_entered():
+        """Checks whether a password entered by the user is correct."""
+        if st.session_state["password"] == st.secrets["APP_PASSWORD"]:
+            st.session_state["password_correct"] = True
+            del st.session_state["password"]  # Don't store the password.
         else:
-            # Check rate limiting again
-            if not login_limiter.is_allowed(login_key):
-                remaining_time = int(login_limiter.attempts.get(login_key, {}).get('blocked_until', time.time()) - time.time())
-                st.error(f"🔒 Too many failed login attempts. Please wait {remaining_time} seconds.")
-                st.stop()
-            
-            try:
-                # Check if the email exists in any branch
-                branch_query = supabase.table("branches").select(
-                    "id, name, code, storekeeper_email, procurement_email, inventory_email, auditor_email, manager_email"
-                ).or_(
-                    f"storekeeper_email.eq.{email},procurement_email.eq.{email},inventory_email.eq.{email},auditor_email.eq.{email},manager_email.eq.{email}"
-                )
-                
-                branch_result = branch_query.execute()
-                found_branches = branch_result.data
-                
-                if found_branches:
-                    # Email exists in at least one branch
-                    # Determine role based on which email field matched
-                    user_role = None
-                    matched_role = None
-                    
-                    for branch in found_branches:
-                        if branch.get('storekeeper_email') == email:
-                            matched_role = "storekeeper"
-                            user_role = "viewer"
-                            break
-                        elif branch.get('procurement_email') == email:
-                            matched_role = "procurement"
-                            user_role = "viewer"
-                            break
-                        elif branch.get('inventory_email') == email:
-                            matched_role = "inventory"
-                            user_role = "viewer"
-                            break
-                        elif branch.get('auditor_email') == email:
-                            matched_role = "auditor"
-                            user_role = "viewer"
-                            break
-                        elif branch.get('manager_email') == email:
-                            matched_role = "manager"
-                            user_role = "admin"
-                            break
-                    
-                    # Check if this is an admin email (can also use admin password)
-                    admin_emails = st.secrets.get("ADMIN_EMAILS", "").split(",")
-                    admin_emails = [e.strip() for e in admin_emails if e.strip()]
-                    
-                    # Add dev_team as admin
-                    dev_team_email = st.secrets.get("DEV_TEAM_EMAIL", "dev_team@company.com")
-                    if dev_team_email:
-                        admin_emails.append(dev_team_email)
-                    
-                    is_admin = user_role == "admin" or email in admin_emails
-                    
-                    # Verify password based on role
-                    if is_admin:
-                        # Admin users can use APP_PASSWORD
-                        if pwd == st.secrets.get("APP_PASSWORD", "changeme"):
-                            st.session_state.authenticated = True
-                            st.session_state.user_role = "admin"
-                            st.session_state.user_email = email
-                            st.session_state.user_branches = found_branches
-                            st.session_state.user_role_match = matched_role or "admin"
-                            login_limiter.reset(login_key)
-                            
-                            logger.info(f"Admin user logged in successfully", {
-                                "email": email, 
-                                "role": matched_role, 
-                                "branch": found_branches[0]['name'] if found_branches else "N/A"
-                            }, security=True)
-                            st.rerun()
-                        else:
-                            # Admin but wrong password
-                            login_limiter.is_allowed(login_key)
-                            attempts_left = login_limiter.max_attempts - login_limiter.attempts.get(login_key, {}).get('count', 0)
-                            st.error(f"❌ Invalid admin password. {attempts_left} attempts remaining.")
-                            logger.warning(f"Failed admin login attempt", {"email": email, "attempts_left": attempts_left}, security=True)
-                    else:
-                        # Non-admin users use VIEWER_PASSWORD
-                        if pwd == st.secrets.get("VIEWER_PASSWORD", ""):
-                            st.session_state.authenticated = True
-                            st.session_state.user_role = "viewer"
-                            st.session_state.user_email = email
-                            st.session_state.user_branches = found_branches
-                            st.session_state.user_role_match = matched_role
-                            login_limiter.reset(login_key)
-                            
-                            logger.info(f"Viewer user logged in successfully", {
-                                "email": email, 
-                                "role": matched_role, 
-                                "branch": found_branches[0]['name'] if found_branches else "N/A"
-                            }, security=True)
-                            st.rerun()
-                        else:
-                            # Non-admin but wrong password
-                            login_limiter.is_allowed(login_key)
-                            attempts_left = login_limiter.max_attempts - login_limiter.attempts.get(login_key, {}).get('count', 0)
-                            st.error(f"❌ Invalid viewer password. {attempts_left} attempts remaining.")
-                            logger.warning(f"Failed viewer login attempt", {"email": email, "attempts_left": attempts_left}, security=True)
-                else:
-                    # Email not found in any branch
-                    # Check if it's a dev_team email
-                    dev_team_email = st.secrets.get("DEV_TEAM_EMAIL", "dev_team@company.com")
-                    if email == dev_team_email and pwd == st.secrets.get("APP_PASSWORD", "changeme"):
-                        # Dev team can login with admin password even if not in branches
-                        st.session_state.authenticated = True
-                        st.session_state.user_role = "admin"
-                        st.session_state.user_email = email
-                        st.session_state.user_branches = []
-                        st.session_state.user_role_match = "dev_team"
-                        login_limiter.reset(login_key)
-                        
-                        logger.info(f"Dev team user logged in successfully", {
-                            "email": email
-                        }, security=True)
-                        st.rerun()
-                    else:
-                        login_limiter.is_allowed(login_key)
-                        attempts_left = login_limiter.max_attempts - login_limiter.attempts.get(login_key, {}).get('count', 0)
-                        st.error(f"❌ Email not registered in any branch. {attempts_left} attempts remaining.")
-                        logger.warning(f"Login attempt with unregistered email", {"email": email}, security=True)
-                        
-                        # Show help for debugging (without exposing emails)
-                        with st.expander("🔍 Need help?"):
-                            st.markdown("""
-                            **Your email must be added to a branch as one of:**
-                            - Storekeeper Email
-                            - Procurement Email  
-                            - Inventory Email
-                            - Auditor Email
-                            - Manager Email
-                            
-                            Contact your administrator to add your email to the appropriate branch.
-                            """)
-                        
-            except Exception as e:
-                logger.error(f"Login error", {"error": str(e), "email": email}, security=True)
-                st.error(f"Login error: Please try again later.")
+            st.session_state["password_correct"] = False
+
+    if "password_correct" not in st.session_state:
+        # First run, show input for password.
+        st.markdown("""
+        <style>
+        .login-container {
+            max-width: 400px;
+            margin: 0 auto;
+            padding: 40px 20px;
+            background-color: #f8f9fa;
+            border-radius: 10px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+        .login-container h1 {
+            margin-bottom: 20px;
+            color: #1f1f1f;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+        
+        st.markdown('<div class="login-container">', unsafe_allow_html=True)
+        st.image("https://img.icons8.com/color/96/000000/inventory.png", width=80)
+        st.title("🔐 Inventory Management System")
+        st.markdown("---")
+        
+        # Password input
+        st.text_input(
+            "Enter password to continue",
+            type="password",
+            placeholder="Enter system password",
+            on_change=password_entered,
+            key="password"
+        )
+        
+        st.markdown("---")
+        st.caption("💡 Contact your system administrator if you don't have the password.")
+        st.markdown('</div>', unsafe_allow_html=True)
+        return False
+
+    if not st.session_state.get("password_correct", False):
+        # Password not correct, show input + error.
+        st.markdown("""
+        <style>
+        .login-container {
+            max-width: 400px;
+            margin: 0 auto;
+            padding: 40px 20px;
+            background-color: #f8f9fa;
+            border-radius: 10px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+        .login-container h1 {
+            margin-bottom: 20px;
+            color: #1f1f1f;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+        
+        st.markdown('<div class="login-container">', unsafe_allow_html=True)
+        st.image("https://img.icons8.com/color/96/000000/inventory.png", width=80)
+        st.title("🔐 Inventory Management System")
+        st.markdown("---")
+        
+        st.text_input(
+            "Enter password to continue",
+            type="password",
+            placeholder="Enter system password",
+            on_change=password_entered,
+            key="password"
+        )
+        
+        if "password_correct" in st.session_state:
+            st.error("😕 Password incorrect")
+        
+        st.markdown("---")
+        st.caption("💡 Contact your system administrator if you don't have the password.")
+        st.markdown('</div>', unsafe_allow_html=True)
+        return False
     
-    # Show rate limit status
-    if login_key in login_limiter.attempts:
-        remaining = login_limiter.max_attempts - login_limiter.attempts[login_key]['count']
-        if remaining > 0 and remaining < login_limiter.max_attempts:
-            st.caption(f"🔒 {remaining} login attempts remaining")
-        elif remaining <= 0:
-            st.caption("🔒 Too many attempts. Please wait.")
-    
-    st.markdown("""
-    <div class="login-help">
-        💡 <strong>Login Help:</strong><br>
-        • Use your registered email address<br>
-        • Managers use the <strong>Admin Password</strong><br>
-        • All other roles use the <strong>Viewer Password</strong><br>
-        • Contact your administrator if you need access
-    </div>
-    """, unsafe_allow_html=True)
-    
-    st.markdown('</div>', unsafe_allow_html=True)
+    # Password correct.
+    return True
+
+# ---------- AUTH CHECK ----------
+if not check_password():
     st.stop()
 
-# After authentication, show user info in sidebar
-if st.session_state.authenticated:
-    # Display user info in sidebar
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("👤 User Info")
-    st.sidebar.write(f"**Email:** {st.session_state.get('user_email', 'N/A')}")
-    st.sidebar.write(f"**Role:** {st.session_state.get('user_role', 'N/A').title()}")
-    if st.session_state.get('user_role_match'):
-        st.sidebar.write(f"**Branch Role:** {st.session_state.get('user_role_match', 'N/A').title()}")
-    
-    # Show branch access
-    if st.session_state.get('user_branches'):
-        branches = st.session_state.user_branches
-        st.sidebar.write("**Access to Branches:**")
-        for branch in branches:
-            st.sidebar.write(f"  • {branch['name']} ({branch['code']})")
-    
-    # Logout button
-    if st.sidebar.button("🚪 Logout", use_container_width=True):
-        logger.info(f"User logged out", {"email": st.session_state.get('user_email')}, security=True)
-        for key in ['authenticated', 'user_role', 'user_email', 'user_branches', 'user_role_match']:
-            if key in st.session_state:
-                del st.session_state[key]
-        st.rerun()
-    st.sidebar.markdown("---")
-
-# ---------- EMAIL LINK AUTO-MARK ----------
-params = st.query_params
-if "alert_id" in params and "action" in params:
-    alert_id = params["alert_id"]
-    try:
-        if not api_limiter.is_allowed(f"api_{st.session_state.user_email}"):
-            st.error("🔒 Too many API requests. Please wait a moment.")
-            st.stop()
-        
-        supabase.table("alert_log").update({
-            "action_taken": "Marked done via email link",
-            "action_date": datetime.now(timezone.utc).isoformat()
-        }).eq("id", alert_id).execute()
-        logger.info(f"Alert {alert_id} marked as done via email link")
-        st.success(f"✅ Alert #{alert_id} marked as done!")
-        st.query_params.clear()
-        st.rerun()
-    except Exception as e:
-        logger.error(f"Failed to mark alert {alert_id} as done", {"error": str(e)})
-        st.error(f"Failed to mark alert: {str(e)}")
+# ---------- SESSION STATE INIT ----------
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = True
+    st.session_state.user_role = "admin"
+    st.session_state.user_email = "admin@demo.com"
 
 # ---------- BRANCH SELECTOR ----------
 @cached_with_invalidation(ttl=3600, key_prefix="branches")
@@ -728,22 +345,24 @@ if selected_branch_name == "All Branches":
 else:
     branch_id = branch_id_map.get(selected_branch_name)
 
-# ---------- NAVIGATION ----------
-# Check if user is dev_team
-is_dev_team = st.session_state.get('user_role_match') == 'dev_team' or st.session_state.get('user_email') == st.secrets.get("DEV_TEAM_EMAIL", "dev_team@company.com")
+# ---------- SIDEBAR USER INFO ----------
+st.sidebar.markdown("---")
+st.sidebar.subheader("👤 User Info")
+st.sidebar.write("**Role:** Administrator")
+st.sidebar.write("**Access:** Full System Access")
 
-if st.session_state.user_role == "admin":
-    pages = ["Dashboard", "Products & Inventory", "Branches", "CSV Upload", 
-             "Alerts & Advisories", "Stock & Demand Limits", "Risk & FEFO", 
-             "Transfer Suggestions", "Data Export"]
-    
-    # Only add System Logs for dev_team members
-    if is_dev_team:
-        pages.append("System Logs")
-else:
-    pages = ["Dashboard", "Products & Inventory", "CSV Upload", 
-             "Alerts & Advisories", "Stock & Demand Limits", "Risk & FEFO", 
-             "Transfer Suggestions", "Data Export"]
+# Logout button
+if st.sidebar.button("🚪 Logout", use_container_width=True):
+    for key in ['password_correct']:
+        if key in st.session_state:
+            del st.session_state[key]
+    st.rerun()
+st.sidebar.markdown("---")
+
+# ---------- NAVIGATION ----------
+pages = ["Dashboard", "Products & Inventory", "Branches", "CSV Upload", 
+         "Alerts & Advisories", "Stock & Demand Limits", "Risk & FEFO", 
+         "Transfer Suggestions", "System Logs", "Data Export"]
 
 page = st.sidebar.radio("Go to", pages)
 
@@ -1105,15 +724,6 @@ def export_data_to_excel(data: List[Dict], filename: str = "export.xlsx") -> byt
         df.to_excel(writer, sheet_name='Data', index=False)
     return excel_buffer.getvalue()
 
-# ---------- SECURITY HEADERS ----------
-def add_security_headers():
-    """Add security headers and information to the page"""
-    # Security headers are handled at the infrastructure level
-    # No visible badges needed in production
-    pass
-
-add_security_headers()
-
 # ============================================================
 # PAGE: DASHBOARD
 # ============================================================
@@ -1153,7 +763,6 @@ if page == "Dashboard":
         st.bar_chart(df_a['alert_type'].value_counts())
     else:
         st.info("No alerts yet. Run daily maintenance function.")
-
 
 # ============================================================
 # PAGE: PRODUCTS & INVENTORY
@@ -1500,16 +1109,10 @@ elif page == "Products & Inventory":
             else:
                 st.info("No products found. Add your first product above!")
 
-
 # ============================================================
-# PAGE: BRANCHES (admin only)
+# PAGE: BRANCHES
 # ============================================================
 elif page == "Branches":
-    if st.session_state.user_role != "admin":
-        st.error("Permission denied.")
-        logger.warning("Unauthorized access attempt to Branches page", security=True)
-        st.stop()
-    
     st.header("🏢 Branch Management")
     st.markdown("""
     **Note:** Users can login using the email addresses listed in any branch.
@@ -1886,7 +1489,6 @@ elif page == "CSV Upload":
                 else:
                     st.error(err)
 
-
 # ============================================================
 # PAGE: ALERTS & ADVISORIES
 # ============================================================
@@ -1898,281 +1500,59 @@ elif page == "Alerts & Advisories":
     - 🟠 **HIGH:** Expiry 121-180 days - Plan for consumption or transfer
     - 🟡 **MEDIUM:** Expiry 181-270 days - Monitor closely
     - 🟢 **LOW:** Expiry > 270 days - Normal inventory
-    
-    **Actions:**
-    - **Consume** - Use the stock (reduces inventory at this branch)
-    - **Transfer** - Move to another branch (reduces inventory at this branch, increases at destination)
-    - **Dispose** - Remove expired/damaged stock (reduces inventory)
-    - **Acknowledge** - Just mark as actioned without inventory changes
     """)
-    
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        alert_filter = st.selectbox(
-            "Filter by status",
-            ["All", "Active", "Resolved"]
-        )
-    with col2:
-        alert_type_filter = st.selectbox(
-            "Filter by type",
-            ["All", "EXPIRY_CRITICAL", "EXPIRY_WARNING", "EXPIRY_MEDIUM", "EXPIRY_LOW"]
-        )
-    with col3:
-        if st.button("🔄 Refresh Alerts", use_container_width=True):
-            CacheManager.invalidate_all()
-            st.rerun()
     
     PAGE_SIZE = 50
     if "alert_page" not in st.session_state:
         st.session_state.alert_page = 0
     offset = st.session_state.alert_page * PAGE_SIZE
     
-    query = supabase.table("alert_log").select(
-        "id,branch_id,product_id,batch,alert_type,details,action_taken,action_date,action_type,affected_quantity,created_at,products(name,sku),branches(name)"
-    ).order("created_at", desc=True)
-    
-    if branch_id:
-        query = query.eq("branch_id", branch_id)
-    
-    if alert_filter == "Active":
-        query = query.is_("action_taken", "null")
-    elif alert_filter == "Resolved":
-        query = query.not_.is_("action_taken", "null")
-    
-    if alert_type_filter != "All":
-        query = query.eq("alert_type", alert_type_filter)
-    
-    alerts = query.range(offset, offset+PAGE_SIZE-1).execute().data
-    
-    total = get_cached_count("alert_log", 
-                            filter_col="branch_id" if branch_id else None,
-                            filter_val=branch_id if branch_id else None)
+    total = get_cached_count("alert_log", filter_col="branch_id" if branch_id else None,
+                             filter_val=branch_id if branch_id else None)
     total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
     
-    if not alerts:
-        st.info("No alerts found.")
-        st.stop()
+    query = supabase.table("alert_log").select("id,branch_id,product_id,batch,alert_type,details,action_taken,created_at,products(name),branches(name)").order("created_at", desc=True)
+    if branch_id:
+        query = query.eq("branch_id", branch_id)
+    alerts = query.range(offset, offset+PAGE_SIZE-1).execute().data
     
-    df_al = pd.DataFrame(alerts)
-    df_al['product'] = df_al['products'].apply(lambda x: x['name'] if x else '')
-    df_al['sku'] = df_al['products'].apply(lambda x: x['sku'] if x else '')
-    df_al['branch'] = df_al['branches'].apply(lambda x: x['name'] if x else '')
-    
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        total_alerts = len(df_al)
-        st.metric("Total Alerts", total_alerts)
-    with col2:
-        active = len(df_al[df_al['action_taken'].isna()])
-        st.metric("Active", active, delta="⚠️" if active > 0 else None)
-    with col3:
-        resolved = len(df_al[df_al['action_taken'].notna()])
-        st.metric("Resolved", resolved)
-    with col4:
-        compliance = round(resolved / total_alerts * 100, 1) if total_alerts else 0
-        st.metric("Compliance", f"{compliance}%")
-    
-    st.divider()
-    
-    for idx, row in df_al.iterrows():
-        is_resolved = pd.notna(row.get('action_taken'))
-        
-        with st.container():
-            col1, col2, col3 = st.columns([3, 2, 1])
-            
-            with col1:
-                if "CRITICAL" in row['alert_type']:
-                    urgency_icon = "🔴"
-                elif "WARNING" in row['alert_type']:
-                    urgency_icon = "🟠"
-                elif "MEDIUM" in row['alert_type']:
-                    urgency_icon = "🟡"
-                else:
-                    urgency_icon = "🟢"
-                    
-                st.markdown(f"{urgency_icon} **{row['product']}** (SKU: {row['sku']})")
-                if row.get('batch'):
-                    st.markdown(f"📦 Batch: `{row['batch']}`")
-                st.caption(f"Branch: {row['branch']} | {row['alert_type']}")
-                if row.get('details'):
-                    st.caption(f"Details: {row['details']}")
-                
-                if is_resolved:
-                    st.caption(f"✅ Resolved: {row['action_taken']} ({row['action_date']})")
-                    if row.get('action_type'):
-                        st.caption(f"Action: {row['action_type']}")
-                    if row.get('affected_quantity'):
-                        st.caption(f"Affected: {row['affected_quantity']} units")
-            
-            with col2:
-                if not is_resolved:
-                    st.markdown("**Take Action:**")
-                    
-                    action_type = st.selectbox(
-                        "Action",
-                        ["Consume", "Transfer", "Dispose", "Acknowledge"],
-                        key=f"action_type_{row['id']}"
-                    )
-                    
-                    max_qty = 1000
-                    if row.get('details'):
-                        try:
-                            import re
-                            qty_match = re.search(r'(\d+)\s*units?', str(row['details']))
-                            if qty_match:
-                                max_qty = int(qty_match.group(1))
-                        except:
-                            pass
-                    
-                    action_qty = st.number_input(
-                        "Quantity to action",
-                        min_value=1,
-                        max_value=max_qty,
-                        value=min(1, max_qty),
-                        key=f"action_qty_{row['id']}"
-                    )
-                    
-                    action_notes = st.text_area(
-                        "Notes",
-                        placeholder="e.g., Transferred to branch X, or Consumed for production...",
-                        key=f"action_notes_{row['id']}"
-                    )
-                    
-                    dest_branch_id = None
-                    if action_type == "Transfer":
-                        available_branches = [b['name'] for b in branches_data if b['id'] != row['branch_id']]
-                        if available_branches:
-                            dest_branch_name = st.selectbox(
-                                "Destination Branch",
-                                available_branches,
-                                key=f"dest_branch_{row['id']}"
-                            )
-                            dest_branch_id = branch_id_map.get(dest_branch_name)
-                        else:
-                            st.warning("No other branches available for transfer.")
-                            dest_branch_id = None
-                    
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        if st.button(f"🚀 Execute {action_type}", key=f"execute_alert_{row['id']}", use_container_width=True):
-                            if action_type == "Transfer" and not dest_branch_id:
-                                st.error("Please select a destination branch.")
-                            else:
-                                if not api_limiter.is_allowed(f"alert_action_{st.session_state.user_email}"):
-                                    st.error("🔒 Too many actions. Please wait.")
-                                    st.stop()
-                                
-                                try:
-                                    with st.spinner(f"Executing {action_type}..."):
-                                        result = supabase.rpc(
-                                            "resolve_alert",
-                                            {
-                                                "p_alert_id": row['id'],
-                                                "p_action_type": action_type.upper(),
-                                                "p_quantity": action_qty,
-                                                "p_notes": action_notes or f"{action_type} by {st.session_state.user_email}",
-                                                "p_executed_by": st.session_state.user_email,
-                                                "p_dest_branch_id": dest_branch_id
-                                            }
-                                        ).execute()
-                                        
-                                        if result.data and result.data.get('success'):
-                                            st.success(f"✅ {action_type} executed successfully!")
-                                            logger.info(f"Alert actioned", {
-                                                "alert_id": row['id'],
-                                                "action": action_type,
-                                                "quantity": action_qty,
-                                                "executed_by": st.session_state.user_email
-                                            })
-                                            CacheManager.invalidate_all()
-                                            time.sleep(1)
-                                            st.rerun()
-                                        else:
-                                            error_msg = result.data.get('error', 'Unknown error') if result.data else 'No response'
-                                            st.error(f"Action failed: {error_msg}")
-                                            
-                                except Exception as e:
-                                    logger.error(f"Failed to execute alert action", {
-                                        "alert_id": row['id'],
-                                        "action": action_type,
-                                        "error": str(e)
-                                    })
-                                    st.error(f"Action failed: {str(e)}")
-                    
-                    with col2:
-                        if st.button("🗑️ Archive Alert", key=f"archive_{row['id']}", use_container_width=True, type="secondary"):
-                            try:
-                                supabase.table("alert_log").update({
-                                    "action_taken": f"Archived by {st.session_state.user_email}",
-                                    "action_date": datetime.now(timezone.utc).isoformat(),
-                                    "action_type": "ARCHIVE"
-                                }).eq("id", row['id']).execute()
-                                st.success("✅ Alert archived!")
-                                CacheManager.invalidate_all()
-                                time.sleep(1)
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Failed to archive: {str(e)}")
-                
-                else:
-                    st.success("✅ Resolved")
-                    if st.button("📋 View Details", key=f"view_{row['id']}"):
-                        with st.expander("Resolution Details", expanded=True):
-                            st.write(f"**Action:** {row.get('action_type', 'N/A')}")
-                            st.write(f"**Notes:** {row['action_taken']}")
-                            st.write(f"**Date:** {row['action_date']}")
-                            if row.get('affected_quantity'):
-                                st.write(f"**Quantity affected:** {row['affected_quantity']} units")
-            
-            with col3:
-                try:
-                    created_at = row['created_at']
-                    if isinstance(created_at, str):
-                        created_at = pd.to_datetime(created_at)
-                    elif isinstance(created_at, pd.Timestamp):
-                        created_at = created_at.to_pydatetime()
-                    
-                    age_days = (datetime.now() - created_at).days
-                    st.caption(f"Alert age: {age_days} days")
-                except Exception as e:
-                    st.caption(f"Alert age: N/A")
-                
-                if not is_resolved and "CRITICAL" in row['alert_type']:
-                    if st.button("⚡ Quick Consume", key=f"quick_{row['id']}", use_container_width=True):
-                        try:
-                            result = supabase.rpc(
-                                "resolve_alert",
-                                {
-                                    "p_alert_id": row['id'],
-                                    "p_action_type": "CONSUME",
-                                    "p_quantity": 1,
-                                    "p_notes": f"Quick consume by {st.session_state.user_email}",
-                                    "p_executed_by": st.session_state.user_email,
-                                    "p_dest_branch_id": None
-                                }
-                            ).execute()
-                            
-                            if result.data and result.data.get('success'):
-                                st.success("✅ Quick consume applied!")
-                                CacheManager.invalidate_all()
-                                time.sleep(1)
-                                st.rerun()
-                            else:
-                                error_msg = result.data.get('error', 'Unknown error') if result.data else 'No response'
-                                st.error(f"Quick consume failed: {error_msg}")
-                        except Exception as e:
-                            st.error(f"Quick consume failed: {str(e)}")
-            
-            st.divider()
+    if alerts:
+        df_al = pd.DataFrame(alerts)
+        df_al['product'] = df_al['products'].apply(lambda x: x['name'] if x else '')
+        df_al['branch'] = df_al['branches'].apply(lambda x: x['name'] if x else '')
+        mobile_friendly_table(df_al[['branch','product','batch','alert_type','details','action_taken','created_at']])
+    else:
+        st.info("No alerts.")
     
     col1, col2 = st.columns(2)
-    if col1.button("⬅️ Prev", disabled=st.session_state.alert_page == 0):
+    if col1.button("Prev Alerts", disabled=st.session_state.alert_page==0):
         st.session_state.alert_page -= 1
         st.rerun()
-    if col2.button("Next ➡️", disabled=st.session_state.alert_page >= total_pages - 1):
+    if col2.button("Next Alerts", disabled=st.session_state.alert_page>=total_pages-1):
         st.session_state.alert_page += 1
         st.rerun()
     st.caption(f"Page {st.session_state.alert_page+1} of {total_pages}")
+    
+    unactioned = [a for a in alerts if not a.get('action_taken')] if alerts else []
+    if unactioned:
+        st.subheader("Manual Action Update")
+        alert_id = st.selectbox("Select Alert ID", [a['id'] for a in unactioned])
+        action_text = st.text_input("Action Description")
+        if st.button("Mark Done"):
+            try:
+                supabase.table("alert_log").update({
+                    "action_taken": action_text,
+                    "action_date": datetime.now(timezone.utc).isoformat()
+                }).eq("id", alert_id).execute()
+                st.success("Marked as done.")
+                logger.info(f"Alert marked as done", {"alert_id": alert_id})
+                CacheManager.invalidate_all()
+                st.rerun()
+            except Exception as e:
+                logger.error(f"Failed to mark alert as done", {"alert_id": alert_id, "error": str(e)})
+                st.error(f"Failed to update: {e}")
+    elif alerts:
+        st.info("All displayed alerts have been actioned.")
 
 # ============================================================
 # PAGE: STOCK & DEMAND LIMITS
@@ -2345,46 +1725,21 @@ elif page == "Risk & FEFO":
 elif page == "Transfer Suggestions":
     st.header("🔄 Inter‑Branch Transfer Suggestions")
     st.markdown("""
-    **Manage and execute transfer suggestions:**
-    1. Review suggestions generated by the system
-    2. **Execute** a suggestion to actually move inventory
-    3. System automatically updates stock levels at both branches
-    4. Track completion status and transfer history
-    
-    **Urgency Levels:**
-    - 🔴 **CRITICAL** – Expiry ≤120 days (4 months) or deficit very high
-    - 🟠 **HIGH** – Expiry 121-180 days (6 months)
-    - 🟡 **MEDIUM** – Expiry 181-270 days (9 months)
-    - 🟢 **LOW** – Expiry > 270 days (9+ months)
+    **Optimised suggestions** – computed entirely inside the database.
+    - **Stock imbalance:** Branch has excess stock; another branch needs it (expiry‑agnostic).
+    - **Expiry risk:** Batch expiring soon in a slow‑selling branch → transfer to a branch with higher demand.
+    - **Urgency (Updated for 120-day threshold):**  
+      - **CRITICAL** – Expiry ≤120 days (4 months) **or** deficit very high (urgent transfer needed)  
+      - **HIGH** – Expiry 121-180 days (6 months)  
+      - **MEDIUM** – Expiry 181-270 days (9 months)
     """)
-    
-    status_filter = st.selectbox(
-        "Filter by status",
-        ["All", "Pending", "Partial", "Complete"]
-    )
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("🔄 Refresh Suggestions", use_container_width=True):
-            CacheManager.invalidate_all()
-            st.rerun()
     
     try:
         query = supabase.table("view_all_transfer_suggestions").select("*")
         if branch_id:
             query = query.eq("from_branch_id", branch_id)
-            
         res = query.execute()
         suggestions = res.data
-        
-        if status_filter != "All" and suggestions:
-            suggestion_ids = [s.get('id') for s in suggestions if s.get('id')]
-            if suggestion_ids:
-                status_query = supabase.table("transfer_suggestions").select("id, status").in_("id", suggestion_ids)
-                status_data = status_query.execute().data
-                status_map = {s['id']: s['status'] for s in status_data}
-                suggestions = [s for s in suggestions if status_map.get(s.get('id')) == status_filter]
-        
     except Exception as e:
         logger.error("Failed to fetch transfer suggestions", {"error": str(e)})
         st.error("⚠️ Unable to fetch transfer suggestions. Please contact your administrator.")
@@ -2394,17 +1749,7 @@ elif page == "Transfer Suggestions":
         st.success("✅ No transfer suggestions at this time. Inventory appears well balanced.")
         st.stop()
     
-    suggestion_ids = [s.get('id') for s in suggestions if s.get('id')]
-    status_map = {}
-    if suggestion_ids:
-        status_query = supabase.table("transfer_suggestions").select("id, status, completed_quantity").in_("id", suggestion_ids)
-        status_data = status_query.execute().data
-        status_map = {s['id']: {'status': s.get('status', 'Pending'), 'completed_quantity': s.get('completed_quantity', 0)} for s in status_data}
-    
     df_sugg = pd.DataFrame(suggestions)
-    df_sugg['status'] = df_sugg['id'].apply(lambda x: status_map.get(x, {}).get('status', 'Pending'))
-    df_sugg['completed_quantity'] = df_sugg['id'].apply(lambda x: status_map.get(x, {}).get('completed_quantity', 0))
-    
     if 'suggestion_type' not in df_sugg.columns:
         df_sugg['suggestion_type'] = df_sugg.apply(
             lambda row: "Expiry Risk Transfer" if pd.notna(row.get('batch')) else "Stock Imbalance Transfer",
@@ -2421,150 +1766,15 @@ elif page == "Transfer Suggestions":
         else:
             return "🟢"
     
-    def get_status_color(status):
-        if status == "Complete":
-            return "✅"
-        elif status == "Partial":
-            return "🟡"
-        else:
-            return "⏳"
-    
     df_sugg['urgency_indicator'] = df_sugg['urgency'].apply(get_urgency_color)
-    df_sugg['status_indicator'] = df_sugg['status'].apply(get_status_color)
-    
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        pending = len(df_sugg[df_sugg['status'] == 'Pending'])
-        st.metric("Pending", pending, delta="⚠️" if pending > 0 else None)
-    with col2:
-        partial = len(df_sugg[df_sugg['status'] == 'Partial'])
-        st.metric("Partial", partial)
-    with col3:
-        complete = len(df_sugg[df_sugg['status'] == 'Complete'])
-        st.metric("Complete", complete, delta="✅" if complete > 0 else None)
-    
-    st.divider()
     
     for idx, row in df_sugg.iterrows():
-        suggestion_id = row.get('id')
-        current_status = row.get('status', 'Pending')
-        
         with st.container():
-            col1, col2, col3 = st.columns([3, 2, 1])
-            
-            with col1:
-                st.markdown(f"{row['urgency_indicator']} **{row['product_name']}** ({row['sku']})")
-                st.markdown(f"📦 {row['quantity']} units from **{row['from_branch']}** → **{row['to_branch']}**")
-                st.caption(f"🏷️ **{row['suggestion_type']}** – {row['reason']}")
-                if pd.notna(row.get('batch')):
-                    st.caption(f"Batch: `{row['batch']}`")
-            
-            with col2:
-                st.markdown(f"**Status:** {get_status_color(current_status)} {current_status}")
-                
-                if current_status == 'Partial' and row.get('completed_quantity', 0) > 0:
-                    completed = int(row['completed_quantity'])
-                    total = int(row['quantity'])
-                    progress_pct = min(completed / total * 100, 100) if total > 0 else 0
-                    st.progress(progress_pct / 100)
-                    st.caption(f"Progress: {completed}/{total} units")
-                
-                if current_status in ['Pending', 'Partial']:
-                    with st.expander("🚚 Execute Transfer", expanded=False):
-                        transfer_qty = st.number_input(
-                            "Quantity to transfer",
-                            min_value=1,
-                            max_value=int(row['quantity']),
-                            value=int(row['quantity']) if current_status == 'Pending' else int(row['quantity']) - int(row.get('completed_quantity', 0)),
-                            key=f"transfer_qty_{suggestion_id}"
-                        )
-                        
-                        transfer_notes = st.text_area(
-                            "Transfer Notes (optional)",
-                            placeholder="e.g., Transferred via truck #123",
-                            key=f"transfer_notes_{suggestion_id}"
-                        )
-                        
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            if st.button("✅ Execute Transfer", key=f"execute_{suggestion_id}", use_container_width=True):
-                                if not api_limiter.is_allowed(f"transfer_{st.session_state.user_email}"):
-                                    st.error("🔒 Too many transfer requests. Please wait.")
-                                    st.stop()
-                                
-                                try:
-                                    with st.spinner("Executing transfer..."):
-                                        result = supabase.rpc(
-                                            "execute_transfer_suggestion",
-                                            {
-                                                "p_suggestion_id": suggestion_id,
-                                                "p_quantity": transfer_qty,
-                                                "p_notes": transfer_notes or f"Transfer executed by {st.session_state.user_email}",
-                                                "p_executed_by": st.session_state.user_email
-                                            }
-                                        ).execute()
-                                        
-                                        if result.data and result.data.get('success'):
-                                            new_status = result.data.get('new_status', 'Complete')
-                                            st.success(f"✅ Transfer executed successfully! {transfer_qty} units moved. Status: {new_status}")
-                                            logger.info(f"Transfer executed", {
-                                                "suggestion_id": suggestion_id,
-                                                "quantity": transfer_qty,
-                                                "from_branch": row['from_branch'],
-                                                "to_branch": row['to_branch'],
-                                                "executed_by": st.session_state.user_email
-                                            })
-                                            CacheManager.invalidate_all()
-                                            time.sleep(1)
-                                            st.rerun()
-                                        else:
-                                            st.error(f"Transfer failed: {result.data.get('error', 'Unknown error')}")
-                                            
-                                except Exception as e:
-                                    logger.error(f"Transfer execution failed", {"suggestion_id": suggestion_id, "error": str(e)})
-                                    st.error(f"Transfer failed: {str(e)}")
-                        
-                        with col2:
-                            if st.button("🗑️ Reject Suggestion", key=f"reject_{suggestion_id}", use_container_width=True, type="secondary"):
-                                try:
-                                    supabase.table("transfer_suggestions").update({
-                                        "status": "Rejected",
-                                        "last_updated": datetime.now(timezone.utc).isoformat(),
-                                        "notes": f"Rejected by {st.session_state.user_email}: {transfer_notes if transfer_notes else 'No reason provided'}"
-                                    }).eq("id", suggestion_id).execute()
-                                    st.success("✅ Suggestion rejected.")
-                                    logger.info(f"Transfer suggestion rejected", {"id": suggestion_id})
-                                    CacheManager.invalidate_all()
-                                    time.sleep(1)
-                                    st.rerun()
-                                except Exception as e:
-                                    st.error(f"Failed to reject: {str(e)}")
-            
-            with col3:
-                if current_status != 'Complete':
-                    if st.button("✅ Mark Complete", key=f"quick_complete_{suggestion_id}", use_container_width=True):
-                        try:
-                            remaining = int(row['quantity']) - int(row.get('completed_quantity', 0))
-                            result = supabase.rpc(
-                                "execute_transfer_suggestion",
-                                {
-                                    "p_suggestion_id": suggestion_id,
-                                    "p_quantity": remaining,
-                                    "p_notes": f"Quick complete by {st.session_state.user_email}",
-                                    "p_executed_by": st.session_state.user_email
-                                }
-                            ).execute()
-                            
-                            if result.data and result.data.get('success'):
-                                st.success("✅ Marked as complete!")
-                                CacheManager.invalidate_all()
-                                time.sleep(1)
-                                st.rerun()
-                            else:
-                                st.error(f"Failed: {result.data.get('error', 'Unknown error')}")
-                        except Exception as e:
-                            st.error(f"Failed: {str(e)}")
-            
+            st.markdown(f"{row['urgency_indicator']} **{row['product_name']}** ({row['sku']})")
+            st.markdown(f"📦 {row['quantity']} units from **{row['from_branch']}** → **{row['to_branch']}**")
+            st.caption(f"🏷️ **{row['suggestion_type']}** – {row['reason']} (Urgency: {row['urgency']})")
+            if pd.notna(row.get('batch')):
+                st.caption(f"Batch: `{row['batch']}`")
             st.divider()
     
     st.subheader("📊 Urgency Breakdown")
@@ -2572,27 +1782,19 @@ elif page == "Transfer Suggestions":
     
     with st.expander("ℹ️ How suggestions are generated"):
         st.markdown("""
-        **Suggestion Lifecycle:**
-        1. **Generated** - System identifies a potential transfer opportunity
-        2. **Pending** - Awaiting review and action
-        3. **Partial** - Some units have been transferred, more remaining
-        4. **Complete** - All units have been transferred
-        
-        **How suggestions are generated:**
         - **Stock imbalance transfer (surplus → deficit):** Branch has more than reorder point + safety stock + 5 units; another branch is below reorder point. Applies to all products (including non‑expiring).
         - **Expiry risk transfer:** Batch expiring ≤120 days (4 months) in a branch with very low demand (<0.5 units/day) → transfer to branch with higher demand.
+        - **Urgency (Updated thresholds):** 
+          - CRITICAL (expiry ≤120 days or deficit very high)
+          - HIGH (expiry 121-180 days)
+          - MEDIUM (expiry 181-270 days)
         - All calculations run inside PostgreSQL using indexed joins – no client‑side processing.
         """)
 
 # ============================================================
-# PAGE: SYSTEM LOGS (dev_team only)
+# PAGE: SYSTEM LOGS
 # ============================================================
 elif page == "System Logs":
-    if not is_dev_team:
-        st.error("Permission denied. This page is only accessible to the development team.")
-        logger.warning("Unauthorized access attempt to System Logs page", {"email": st.session_state.get('user_email')}, security=True)
-        st.stop()
-    
     st.header("📋 System Logs")
     st.markdown("View structured system logs for debugging and monitoring.")
     
@@ -2653,7 +1855,6 @@ elif page == "Data Export":
         "Risk Scores",
         "Alert Log",
         "Transfer Suggestions",
-        "Transfer History",
         "Registered Users"
     ])
     
@@ -2707,27 +1908,9 @@ elif page == "Data Export":
                     data = query.execute().data
                     filename = f"transfer_suggestions_{datetime.now().strftime('%Y%m%d')}"
                 
-                elif export_type == "Transfer History":
-                    query = supabase.table("transfers").select("*, from_branches(name), to_branches(name), products(name)")
-                    if branch_id:
-                        query = query.or_(f"from_branch_id.eq.{branch_id},to_branch_id.eq.{branch_id}")
-                    data = query.execute().data
-                    filename = f"transfer_history_{datetime.now().strftime('%Y%m%d')}"
-                
                 elif export_type == "Registered Users":
-                    registered_users = get_registered_emails()
-                    data = []
-                    for user in registered_users:
-                        branch_info = []
-                        for branch in user['branches']:
-                            branch_info.append(f"{branch['name']} ({branch['role']})")
-                        
-                        data.append({
-                            "Email": user['email'],
-                            "Role": user['role'],
-                            "Access Level": user['access'],
-                            "Branches": ", ".join(branch_info) if branch_info else "No branch assigned"
-                        })
+                    # Simple placeholder for registered users
+                    data = [{"message": "User management available in full version"}]
                     filename = f"registered_users_{datetime.now().strftime('%Y%m%d')}"
                 
                 if data:
