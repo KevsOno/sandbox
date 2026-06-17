@@ -787,10 +787,17 @@ else:
     branch_id = branch_id_map.get(selected_branch_name)
 
 # ---------- NAVIGATION ----------
+# Check if user is dev_team
+is_dev_team = st.session_state.get('user_role_match') == 'dev_team' or st.session_state.get('user_email') == st.secrets.get("DEV_TEAM_EMAIL", "dev_team@company.com")
+
 if st.session_state.user_role == "admin":
     pages = ["Dashboard", "Products & Inventory", "Branches", "CSV Upload", 
              "Alerts & Advisories", "Stock & Demand Limits", "Risk & FEFO", 
-             "Transfer Suggestions", "Data Export", "System Logs"]
+             "Transfer Suggestions", "Data Export"]
+    
+    # Only add System Logs for dev_team members
+    if is_dev_team:
+        pages.append("System Logs")
 else:
     pages = ["Dashboard", "Products & Inventory", "CSV Upload", 
              "Alerts & Advisories", "Stock & Demand Limits", "Risk & FEFO", 
@@ -1159,46 +1166,9 @@ def export_data_to_excel(data: List[Dict], filename: str = "export.xlsx") -> byt
 # ---------- SECURITY HEADERS ----------
 def add_security_headers():
     """Add security headers and information to the page"""
-    st.markdown("""
-    <style>
-    .security-badge {
-        position: fixed;
-        bottom: 10px;
-        right: 10px;
-        background: rgba(0,0,0,0.7);
-        color: white;
-        padding: 5px 10px;
-        border-radius: 5px;
-        font-size: 12px;
-        z-index: 999;
-        font-family: monospace;
-    }
-    .security-badge .secure {
-        color: #00ff00;
-    }
-    .security-badge .insecure {
-        color: #ff0000;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-    
-    try:
-        is_production = os.environ.get("STREAMLIT_ENV", "").lower() == "production"
-        if is_production:
-            status = "🔒 Secure (HTTPS)"
-            color = "secure"
-        else:
-            status = "🔓 Development"
-            color = "insecure"
-        
-        st.markdown(f"""
-        <div class="security-badge">
-            <span class="{color}">{status}</span> | 
-            Rate Limit: {login_limiter.max_attempts} attempts
-        </div>
-        """, unsafe_allow_html=True)
-    except:
-        pass
+    # Security headers are handled at the infrastructure level
+    # No visible badges needed in production
+    pass
 
 add_security_headers()
 
@@ -2733,12 +2703,13 @@ elif page == "Transfer Suggestions":
         """)
 
 # ============================================================
-# PAGE: SYSTEM LOGS (admin only)
+# PAGE: SYSTEM LOGS (dev_team only)
 # ============================================================
 elif page == "System Logs":
-    if st.session_state.user_role != "admin":
-        st.error("Permission denied.")
-        logger.warning("Unauthorized access attempt to System Logs page", security=True)
+    # Double-check dev_team access
+    if not is_dev_team:
+        st.error("Permission denied. This page is only accessible to the development team.")
+        logger.warning("Unauthorized access attempt to System Logs page", {"email": st.session_state.get('user_email')}, security=True)
         st.stop()
     
     st.header("📋 System Logs")
