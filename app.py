@@ -435,14 +435,6 @@ if not st.session_state.authenticated:
         border-radius: 5px;
         border-left: 4px solid #ffc107;
     }
-    .registered-emails {
-        font-size: 0.85em;
-        margin-top: 10px;
-        padding: 10px;
-        background-color: #e8f5e9;
-        border-radius: 5px;
-        border-left: 4px solid #4caf50;
-    }
     </style>
     """, unsafe_allow_html=True)
     
@@ -454,42 +446,6 @@ if not st.session_state.authenticated:
         st.image("https://img.icons8.com/color/96/000000/inventory.png", width=80)
     
     st.title("🔐 Inventory Management System")
-    
-    st.markdown("---")
-    
-    # Option to view registered emails (admin only)
-    show_emails = st.checkbox("📋 Show registered emails (admin only)")
-    if show_emails:
-        admin_check = st.text_input("Enter admin password to view registered emails", type="password")
-        if admin_check == st.secrets.get("APP_PASSWORD", "changeme"):
-            registered_emails = get_registered_emails()
-            if registered_emails:
-                st.markdown('<div class="registered-emails">', unsafe_allow_html=True)
-                st.subheader("📧 Registered Emails")
-                
-                # Create a DataFrame for better display
-                df_emails = pd.DataFrame(registered_emails)
-                df_emails['branches'] = df_emails['branches'].apply(
-                    lambda x: ', '.join([f"{b['name']} ({b['role']})" for b in x]) if x else "No branch assigned"
-                )
-                st.dataframe(df_emails[['email', 'role', 'access', 'branches']])
-                
-                # Summary stats
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Total Users", len(registered_emails))
-                with col2:
-                    admin_count = len([e for e in registered_emails if e['access'] == 'Admin'])
-                    st.metric("Admins", admin_count)
-                with col3:
-                    viewer_count = len([e for e in registered_emails if e['access'] == 'Viewer'])
-                    st.metric("Viewers", viewer_count)
-                
-                st.markdown('</div>', unsafe_allow_html=True)
-            else:
-                st.info("No registered emails found.")
-        elif admin_check:
-            st.error("Incorrect admin password")
     
     st.markdown("---")
     
@@ -640,8 +596,8 @@ if not st.session_state.authenticated:
                         st.error(f"❌ Email not registered in any branch. {attempts_left} attempts remaining.")
                         logger.warning(f"Login attempt with unregistered email", {"email": email}, security=True)
                         
-                        # Show help for debugging
-                        with st.expander("🔍 Need help? Check registered emails"):
+                        # Show help for debugging (without exposing emails)
+                        with st.expander("🔍 Need help?"):
                             st.markdown("""
                             **Your email must be added to a branch as one of:**
                             - Storekeeper Email
@@ -652,20 +608,6 @@ if not st.session_state.authenticated:
                             
                             Contact your administrator to add your email to the appropriate branch.
                             """)
-                            
-                            # Show registered emails (only if admin password is entered correctly)
-                            admin_check = st.text_input("Enter admin password to view registered emails", type="password", key="login_admin_check")
-                            if admin_check == st.secrets.get("APP_PASSWORD", "changeme"):
-                                registered_emails = get_registered_emails()
-                                if registered_emails:
-                                    st.subheader("📧 Registered Emails")
-                                    df_emails = pd.DataFrame(registered_emails)
-                                    df_emails['branches'] = df_emails['branches'].apply(
-                                        lambda x: ', '.join([f"{b['name']} ({b['role']})" for b in x]) if x else "No branch assigned"
-                                    )
-                                    st.dataframe(df_emails[['email', 'role', 'access', 'branches']])
-                            elif admin_check:
-                                st.error("Incorrect admin password")
                         
             except Exception as e:
                 logger.error(f"Login error", {"error": str(e), "email": email}, security=True)
@@ -757,7 +699,7 @@ def get_branches():
 # Get data with error handling
 branches_data = get_branches()
 
-# Create simple lookup maps (like the old version)
+# Create simple lookup maps
 branch_names = [b['name'] for b in branches_data] if branches_data else []
 branch_id_map = {b['name']: b['id'] for b in branches_data} if branches_data else {}
 branch_code_map = {b['id']: b['code'] for b in branches_data} if branches_data else {}
@@ -780,7 +722,7 @@ else:
     st.sidebar.warning("⚠️ No branches available. Please add branches in the Branches page.")
     selected_branch_name = "All Branches"
 
-# Simple branch_id assignment (like the old version)
+# Simple branch_id assignment
 if selected_branch_name == "All Branches":
     branch_id = None
 else:
@@ -1193,7 +1135,7 @@ if page == "Dashboard":
     with col1:
         st.metric("Total Inventory Value", f"₦{total_val:,.0f}")
     with col2:
-        st.metric("Waste Risk (next 120d)", f"₦{waste_val:,.0f}")  # Updated to 120 days
+        st.metric("Waste Risk (next 120d)", f"₦{waste_val:,.0f}")
 
     alert_query = supabase.table("alert_log").select("alert_type, action_taken")
     if branch_id:
@@ -1214,7 +1156,7 @@ if page == "Dashboard":
 
 
 # ============================================================
-# PAGE: PRODUCTS & INVENTORY - FIXED EDIT PRODUCT
+# PAGE: PRODUCTS & INVENTORY
 # ============================================================
 elif page == "Products & Inventory":
     st.header("📦 Products & Inventory Management")
@@ -1236,14 +1178,12 @@ elif page == "Products & Inventory":
         if st.button("📊 View All Products", use_container_width=True):
             st.session_state.show_all_products = True
             st.session_state.show_inventory = False
-            # Clear any edit state
             if 'edit_product_id' in st.session_state:
                 del st.session_state.edit_product_id
     with col3:
         if st.button("📦 View All Inventory", use_container_width=True):
             st.session_state.show_inventory = True
             st.session_state.show_all_products = False
-            # Clear any edit state
             if 'edit_product_id' in st.session_state:
                 del st.session_state.edit_product_id
     with col4:
@@ -1329,7 +1269,6 @@ elif page == "Products & Inventory":
                                 st.session_state.edit_product_id = product['id']
                                 st.rerun()
                         
-                        # If this product is selected for editing, show edit form
                         if st.session_state.edit_product_id == product['id']:
                             st.markdown("---")
                             st.subheader(f"✏️ Editing: {product['name']} ({product['sku']})")
@@ -1380,9 +1319,7 @@ elif page == "Products & Inventory":
                                         confirm_delete = st.checkbox("Confirm deletion", key=f"confirm_delete_{product['id']}")
                                         if confirm_delete:
                                             try:
-                                                # Delete inventory first
                                                 supabase.table("inventory").delete().eq("product_id", product['id']).execute()
-                                                # Delete product
                                                 supabase.table("products").delete().eq("id", product['id']).execute()
                                                 st.success("✅ Product and associated inventory deleted.")
                                                 logger.info(f"Product deleted", {"sku": product['sku']})
@@ -1497,12 +1434,10 @@ elif page == "Products & Inventory":
                 st.caption(f"Page {st.session_state.prod_page+1} of {total_pages}")
                 
                 st.subheader("✏️ Edit Product")
-                # Create a list of product options with SKU and Name
                 product_options = [f"{p['sku']} - {p['name']}" for p in prods]
                 selected_option = st.selectbox("Select product to edit", product_options, key="edit_product_select")
                 
                 if selected_option:
-                    # Extract SKU from the selected option
                     selected_sku = selected_option.split(" - ")[0]
                     product = next(p for p in prods if p['sku'] == selected_sku)
                     
@@ -1549,9 +1484,7 @@ elif page == "Products & Inventory":
                                 confirm_delete = st.checkbox("Confirm deletion", key="confirm_delete_main")
                                 if confirm_delete:
                                     try:
-                                        # Delete inventory first
                                         supabase.table("inventory").delete().eq("product_id", product['id']).execute()
-                                        # Delete product
                                         supabase.table("products").delete().eq("id", product['id']).execute()
                                         st.success("✅ Product and associated inventory deleted.")
                                         logger.info(f"Product deleted", {"sku": product['sku']})
@@ -1563,11 +1496,9 @@ elif page == "Products & Inventory":
                         
                         with col3:
                             if st.form_submit_button("🔄 Reset Values", use_container_width=True):
-                                # Just refresh the page to reset form values
                                 st.rerun()
             else:
                 st.info("No products found. Add your first product above!")
-
 
 
 # ============================================================
@@ -1588,7 +1519,6 @@ elif page == "Branches":
     **Email Management:** When you expand a branch, all existing emails will be displayed in the appropriate text boxes for easy editing.
     """)
     
-    # Get all branches with full details
     @cached_with_invalidation(ttl=60, key_prefix="branches_full")
     def get_branches_full():
         """Get branches with all fields including emails"""
@@ -1607,12 +1537,7 @@ elif page == "Branches":
         st.info("No branches found. Use 'Add Branch' below.")
     else:
         for branch in branches:
-            # Create a unique key for each branch form
-            branch_key = f"branch_{branch['id']}"
-            
-            # Show current emails in a summary
             with st.expander(f"📋 {branch['name']} ({branch['code']})", expanded=False):
-                # Show email summary
                 col1, col2 = st.columns(2)
                 with col1:
                     st.markdown("**Current Emails:**")
@@ -1676,7 +1601,6 @@ elif page == "Branches":
                             help="This user will have Admin access"
                         )
                     
-                    # Show role summary
                     st.info("""
                     **Role Mapping:**
                     - Storekeeper, Procurement, Inventory, Auditor → **Viewer** (uses Viewer Password)
@@ -1688,20 +1612,17 @@ elif page == "Branches":
                         submitted = st.form_submit_button("💾 Save Changes", use_container_width=True)
                     with col2:
                         if st.form_submit_button("🔄 Reset to Current", use_container_width=True):
-                            # Force refresh the branch data
                             CacheManager.invalidate_all()
                             st.rerun()
                     
                     if submitted:
                         update_data = {}
                         
-                        # Check each field for changes
                         if new_name != branch['name']:
                             update_data['name'] = new_name
                         if new_code != branch['code']:
                             update_data['code'] = new_code
                         
-                        # Email fields - update if changed or set to empty
                         if new_storekeeper != branch.get('storekeeper_email', ''):
                             update_data['storekeeper_email'] = new_storekeeper or None
                         if new_procurement != branch.get('procurement_email', ''):
@@ -1717,14 +1638,11 @@ elif page == "Branches":
                             try:
                                 supabase.table("branches").update(update_data).eq("id", branch['id']).execute()
                                 st.success(f"✅ Branch '{new_name}' updated successfully!")
-                                
-                                # Log the changes
                                 logger.info(f"Branch updated", {
                                     "id": branch['id'], 
                                     "name": new_name,
                                     "updated_fields": list(update_data.keys())
                                 })
-                                
                                 CacheManager.invalidate_all()
                                 st.rerun()
                             except Exception as e:
@@ -1767,7 +1685,8 @@ elif page == "Branches":
                         "procurement_email": procurement_email or None,
                         "inventory_email": inventory_email or None,
                         "auditor_email": auditor_email or None,
-                        "manager_email": manager_email or None                    }).execute()
+                        "manager_email": manager_email or None
+                    }).execute()
                     st.success(f"Branch '{name}' added.")
                     logger.info(f"Branch added", {"name": name, "code": code})
                     CacheManager.invalidate_all()
@@ -1969,7 +1888,7 @@ elif page == "CSV Upload":
 
 
 # ============================================================
-# PAGE: ALERTS & ADVISORIES - WITH ACTION HANDLING
+# PAGE: ALERTS & ADVISORIES
 # ============================================================
 elif page == "Alerts & Advisories":
     st.header("🚨 Alerts & Advisories")
@@ -1987,7 +1906,6 @@ elif page == "Alerts & Advisories":
     - **Acknowledge** - Just mark as actioned without inventory changes
     """)
     
-    # Filter options
     col1, col2, col3 = st.columns(3)
     with col1:
         alert_filter = st.selectbox(
@@ -2009,7 +1927,6 @@ elif page == "Alerts & Advisories":
         st.session_state.alert_page = 0
     offset = st.session_state.alert_page * PAGE_SIZE
     
-    # Build query to include new tracking columns
     query = supabase.table("alert_log").select(
         "id,branch_id,product_id,batch,alert_type,details,action_taken,action_date,action_type,affected_quantity,created_at,products(name,sku),branches(name)"
     ).order("created_at", desc=True)
@@ -2027,7 +1944,6 @@ elif page == "Alerts & Advisories":
     
     alerts = query.range(offset, offset+PAGE_SIZE-1).execute().data
     
-    # Get total for pagination
     total = get_cached_count("alert_log", 
                             filter_col="branch_id" if branch_id else None,
                             filter_val=branch_id if branch_id else None)
@@ -2037,13 +1953,11 @@ elif page == "Alerts & Advisories":
         st.info("No alerts found.")
         st.stop()
     
-    # Process alerts for display
     df_al = pd.DataFrame(alerts)
     df_al['product'] = df_al['products'].apply(lambda x: x['name'] if x else '')
     df_al['sku'] = df_al['products'].apply(lambda x: x['sku'] if x else '')
     df_al['branch'] = df_al['branches'].apply(lambda x: x['name'] if x else '')
     
-    # Display summary stats
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         total_alerts = len(df_al)
@@ -2060,7 +1974,6 @@ elif page == "Alerts & Advisories":
     
     st.divider()
     
-    # Display alerts with action buttons
     for idx, row in df_al.iterrows():
         is_resolved = pd.notna(row.get('action_taken'))
         
@@ -2068,7 +1981,6 @@ elif page == "Alerts & Advisories":
             col1, col2, col3 = st.columns([3, 2, 1])
             
             with col1:
-                # Determine urgency icon
                 if "CRITICAL" in row['alert_type']:
                     urgency_icon = "🔴"
                 elif "WARNING" in row['alert_type']:
@@ -2085,7 +1997,6 @@ elif page == "Alerts & Advisories":
                 if row.get('details'):
                     st.caption(f"Details: {row['details']}")
                 
-                # Show resolution details if resolved
                 if is_resolved:
                     st.caption(f"✅ Resolved: {row['action_taken']} ({row['action_date']})")
                     if row.get('action_type'):
@@ -2095,7 +2006,6 @@ elif page == "Alerts & Advisories":
             
             with col2:
                 if not is_resolved:
-                    # Action buttons
                     st.markdown("**Take Action:**")
                     
                     action_type = st.selectbox(
@@ -2104,11 +2014,9 @@ elif page == "Alerts & Advisories":
                         key=f"action_type_{row['id']}"
                     )
                     
-                    # Get max quantity from alert details or use a default
-                    max_qty = 1000  # Default fallback
+                    max_qty = 1000
                     if row.get('details'):
                         try:
-                            # Try to extract quantity from details
                             import re
                             qty_match = re.search(r'(\d+)\s*units?', str(row['details']))
                             if qty_match:
@@ -2132,7 +2040,6 @@ elif page == "Alerts & Advisories":
                     
                     dest_branch_id = None
                     if action_type == "Transfer":
-                        # Show destination branch selector
                         available_branches = [b['name'] for b in branches_data if b['id'] != row['branch_id']]
                         if available_branches:
                             dest_branch_name = st.selectbox(
@@ -2145,7 +2052,6 @@ elif page == "Alerts & Advisories":
                             st.warning("No other branches available for transfer.")
                             dest_branch_id = None
                     
-                    # Execute action button
                     col1, col2 = st.columns(2)
                     with col1:
                         if st.button(f"🚀 Execute {action_type}", key=f"execute_alert_{row['id']}", use_container_width=True):
@@ -2219,7 +2125,6 @@ elif page == "Alerts & Advisories":
                                 st.write(f"**Quantity affected:** {row['affected_quantity']} units")
             
             with col3:
-                # Show age of alert - FIXED: properly convert to datetime
                 try:
                     created_at = row['created_at']
                     if isinstance(created_at, str):
@@ -2232,7 +2137,6 @@ elif page == "Alerts & Advisories":
                 except Exception as e:
                     st.caption(f"Alert age: N/A")
                 
-                # Quick action for critical alerts
                 if not is_resolved and "CRITICAL" in row['alert_type']:
                     if st.button("⚡ Quick Consume", key=f"quick_{row['id']}", use_container_width=True):
                         try:
@@ -2261,7 +2165,6 @@ elif page == "Alerts & Advisories":
             
             st.divider()
     
-    # Pagination
     col1, col2 = st.columns(2)
     if col1.button("⬅️ Prev", disabled=st.session_state.alert_page == 0):
         st.session_state.alert_page -= 1
@@ -2437,7 +2340,7 @@ elif page == "Risk & FEFO":
         """)
 
 # ============================================================
-# PAGE: TRANSFER SUGGESTIONS - WITH EXECUTION
+# PAGE: TRANSFER SUGGESTIONS
 # ============================================================
 elif page == "Transfer Suggestions":
     st.header("🔄 Inter‑Branch Transfer Suggestions")
@@ -2455,13 +2358,11 @@ elif page == "Transfer Suggestions":
     - 🟢 **LOW** – Expiry > 270 days (9+ months)
     """)
     
-    # Status filter
     status_filter = st.selectbox(
         "Filter by status",
         ["All", "Pending", "Partial", "Complete"]
     )
     
-    # Add refresh button
     col1, col2 = st.columns(2)
     with col1:
         if st.button("🔄 Refresh Suggestions", use_container_width=True):
@@ -2469,28 +2370,19 @@ elif page == "Transfer Suggestions":
             st.rerun()
     
     try:
-        # Get suggestions from the view
         query = supabase.table("view_all_transfer_suggestions").select("*")
         if branch_id:
             query = query.eq("from_branch_id", branch_id)
-        
-        if status_filter != "All":
-            # Note: The view doesn't have status column, so we need to get from transfer_suggestions table
-            # For now, just get all and filter in Python
-            pass
             
         res = query.execute()
         suggestions = res.data
         
-        # If we have status filtering, get status from transfer_suggestions table
         if status_filter != "All" and suggestions:
             suggestion_ids = [s.get('id') for s in suggestions if s.get('id')]
             if suggestion_ids:
                 status_query = supabase.table("transfer_suggestions").select("id, status").in_("id", suggestion_ids)
                 status_data = status_query.execute().data
                 status_map = {s['id']: s['status'] for s in status_data}
-                
-                # Filter suggestions by status
                 suggestions = [s for s in suggestions if status_map.get(s.get('id')) == status_filter]
         
     except Exception as e:
@@ -2502,7 +2394,6 @@ elif page == "Transfer Suggestions":
         st.success("✅ No transfer suggestions at this time. Inventory appears well balanced.")
         st.stop()
     
-    # Check if we have status info
     suggestion_ids = [s.get('id') for s in suggestions if s.get('id')]
     status_map = {}
     if suggestion_ids:
@@ -2511,8 +2402,6 @@ elif page == "Transfer Suggestions":
         status_map = {s['id']: {'status': s.get('status', 'Pending'), 'completed_quantity': s.get('completed_quantity', 0)} for s in status_data}
     
     df_sugg = pd.DataFrame(suggestions)
-    
-    # Add status column
     df_sugg['status'] = df_sugg['id'].apply(lambda x: status_map.get(x, {}).get('status', 'Pending'))
     df_sugg['completed_quantity'] = df_sugg['id'].apply(lambda x: status_map.get(x, {}).get('completed_quantity', 0))
     
@@ -2543,7 +2432,6 @@ elif page == "Transfer Suggestions":
     df_sugg['urgency_indicator'] = df_sugg['urgency'].apply(get_urgency_color)
     df_sugg['status_indicator'] = df_sugg['status'].apply(get_status_color)
     
-    # Display summary statistics
     col1, col2, col3 = st.columns(3)
     with col1:
         pending = len(df_sugg[df_sugg['status'] == 'Pending'])
@@ -2557,7 +2445,6 @@ elif page == "Transfer Suggestions":
     
     st.divider()
     
-    # Display suggestions with execution functionality
     for idx, row in df_sugg.iterrows():
         suggestion_id = row.get('id')
         current_status = row.get('status', 'Pending')
@@ -2575,7 +2462,6 @@ elif page == "Transfer Suggestions":
             with col2:
                 st.markdown(f"**Status:** {get_status_color(current_status)} {current_status}")
                 
-                # Show progress for partial transfers
                 if current_status == 'Partial' and row.get('completed_quantity', 0) > 0:
                     completed = int(row['completed_quantity'])
                     total = int(row['quantity'])
@@ -2583,10 +2469,8 @@ elif page == "Transfer Suggestions":
                     st.progress(progress_pct / 100)
                     st.caption(f"Progress: {completed}/{total} units")
                 
-                # Show execution form for pending/partial suggestions
                 if current_status in ['Pending', 'Partial']:
                     with st.expander("🚚 Execute Transfer", expanded=False):
-                        # Allow partial transfer
                         transfer_qty = st.number_input(
                             "Quantity to transfer",
                             min_value=1,
@@ -2610,7 +2494,6 @@ elif page == "Transfer Suggestions":
                                 
                                 try:
                                     with st.spinner("Executing transfer..."):
-                                        # Call the stored procedure
                                         result = supabase.rpc(
                                             "execute_transfer_suggestion",
                                             {
@@ -2658,7 +2541,6 @@ elif page == "Transfer Suggestions":
                                     st.error(f"Failed to reject: {str(e)}")
             
             with col3:
-                # Quick complete button for pending/partial
                 if current_status != 'Complete':
                     if st.button("✅ Mark Complete", key=f"quick_complete_{suggestion_id}", use_container_width=True):
                         try:
@@ -2706,7 +2588,6 @@ elif page == "Transfer Suggestions":
 # PAGE: SYSTEM LOGS (dev_team only)
 # ============================================================
 elif page == "System Logs":
-    # Double-check dev_team access
     if not is_dev_team:
         st.error("Permission denied. This page is only accessible to the development team.")
         logger.warning("Unauthorized access attempt to System Logs page", {"email": st.session_state.get('user_email')}, security=True)
